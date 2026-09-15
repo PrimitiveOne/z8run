@@ -204,7 +204,10 @@ async fn cmd_serve(
     std::fs::create_dir_all(format!("{}/plugins", data_dir))?;
 
     // Scan plugins
-    let registry = z8run_runtime::registry::PluginRegistry::new(format!("{}/plugins", data_dir));
+    let registry = std::sync::Arc::new(z8run_runtime::registry::PluginRegistry::new(format!(
+        "{}/plugins",
+        data_dir
+    )));
     let plugin_count = registry.scan().await.unwrap_or(0);
     tracing::info!(plugins = plugin_count, "Plugins scanned");
 
@@ -301,6 +304,7 @@ async fn cmd_serve(
         vault,
         jwt_secret,
         port,
+        std::sync::Arc::clone(&registry),
     ));
 
     // Register built-in node executors

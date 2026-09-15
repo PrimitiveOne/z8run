@@ -108,6 +108,22 @@ impl PluginRegistry {
         self.plugins.read().await.get(name).cloned()
     }
 
+    /// Looks a plugin up by the node type a flow actually references.
+    ///
+    /// Accepts both the qualified `source/name` identity and the bare `name`
+    /// alias, because flows written before namespacing use the latter. Returns
+    /// `None` for built-in types, which have no manifest.
+    pub async fn get_by_node_type(&self, node_type: &str) -> Option<RegisteredPlugin> {
+        let plugins = self.plugins.read().await;
+        if let Some(p) = plugins.get(node_type) {
+            return Some(p.clone());
+        }
+        plugins
+            .values()
+            .find(|p| p.manifest.qualified_name() == node_type)
+            .cloned()
+    }
+
     /// Lists all registered plugins.
     pub async fn list(&self) -> Vec<RegisteredPlugin> {
         self.plugins.read().await.values().cloned().collect()

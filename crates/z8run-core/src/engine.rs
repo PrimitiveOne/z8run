@@ -281,8 +281,25 @@ impl FlowEngine {
     /// Registers a node factory for a specific type.
     pub async fn register_node_type(&self, factory: Arc<dyn NodeExecutorFactory>) {
         let node_type = factory.node_type().to_string();
+        self.register_node_type_as(&node_type, factory).await;
+    }
+
+    /// Registers a factory under an EXPLICIT node type.
+    ///
+    /// Needed because one factory is reachable under two keys: its qualified
+    /// `source/name` identity, and — when free — the bare `name`, so flows
+    /// written before namespacing keep resolving. Registering the same `Arc`
+    /// twice shares the loaded module rather than duplicating it.
+    pub async fn register_node_type_as(
+        &self,
+        node_type: &str,
+        factory: Arc<dyn NodeExecutorFactory>,
+    ) {
         info!(node_type = %node_type, "Registering node type");
-        self.node_registry.write().await.insert(node_type, factory);
+        self.node_registry
+            .write()
+            .await
+            .insert(node_type.to_string(), factory);
     }
 
     /// Is this node type registered?
@@ -293,6 +310,20 @@ impl FlowEngine {
     /// unsupported.
     pub async fn has_node_type(&self, node_type: &str) -> bool {
         self.node_registry.read().await.contains_key(node_type)
+    }
+
+    /// The identity of whatever is registered under `node_type`.
+    ///
+    /// A factory reachable under an alias still reports its OWN type, so this
+    /// answers "does this key actually resolve to that node, or to something
+    /// else wearing the same name?" — which is the only way to tell a real
+    /// alias from a collision.
+    pub async fn node_type_identity(&self, node_type: &str) -> Option<String> {
+        self.node_registry
+            .read()
+            .await
+            .get(node_type)
+            .map(|f| f.node_type().to_string())
     }
 
     /// Every registered node type, sorted. For diagnostics and for error

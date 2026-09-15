@@ -105,6 +105,9 @@ pub struct WasmNodeFactory {
     wasm_bytes: Vec<u8>,
     sandbox_config: SandboxConfig,
     manifest: PluginManifest,
+    /// Cached `source/name`. `node_type()` returns `&str`, so the qualified
+    /// form has to be owned rather than formatted on each call.
+    node_type: String,
 }
 
 impl WasmNodeFactory {
@@ -115,6 +118,7 @@ impl WasmNodeFactory {
         manifest: PluginManifest,
     ) -> Result<Self, RuntimeError> {
         Ok(Self {
+            node_type: manifest.qualified_name(),
             wasm_bytes,
             sandbox_config,
             manifest,
@@ -156,7 +160,7 @@ impl NodeExecutorFactory for WasmNodeFactory {
 
         let mut executor = WasmNodeExecutor {
             instance: Arc::new(Mutex::new(instance)),
-            node_type_name: self.manifest.name.clone(),
+            node_type_name: self.node_type.clone(),
         };
 
         // Configure the node if config is not empty
@@ -169,6 +173,14 @@ impl NodeExecutorFactory for WasmNodeFactory {
     }
 
     fn node_type(&self) -> &str {
-        &self.manifest.name
+        &self.node_type
+    }
+}
+
+impl WasmNodeFactory {
+    /// The manifest this factory was built from — the source of the node's
+    /// schema for `/api/v1/nodes`.
+    pub fn manifest(&self) -> &PluginManifest {
+        &self.manifest
     }
 }

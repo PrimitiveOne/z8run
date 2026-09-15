@@ -57,7 +57,7 @@ pub async fn register_plugins(
         match load_and_register_plugin(engine, plugin).await {
             Ok(_) => {
                 info!(
-                    plugin = %plugin.manifest.name,
+                    plugin = %plugin.manifest.qualified_name(),
                     version = %plugin.manifest.version,
                     "Plugin registered with engine"
                 );
@@ -81,6 +81,13 @@ async fn load_and_register_plugin(
     engine: &FlowEngine,
     plugin: &RegisteredPlugin,
 ) -> Result<(), RuntimeError> {
+    // An ambiguous alias table has no correct resolution — refuse the plugin
+    // rather than let hash ordering decide which parameter wins.
+    plugin
+        .manifest
+        .validate_params()
+        .map_err(RuntimeError::Manifest)?;
+
     // Load WASM bytes from disk
     let wasm_bytes = tokio::fs::read(&plugin.wasm_path)
         .await
@@ -88,9 +95,29 @@ async fn load_and_register_plugin(
 
     // Create factory from manifest and bytes
     let factory = WasmNodeFactory::from_manifest_and_bytes(plugin.manifest.clone(), wasm_bytes)?;
+    let factory: Arc<dyn z8run_core::engine::NodeExecutorFactory> = Arc::new(factory);
 
-    // Register with engine
-    engine.register_node_type(Arc::new(factory)).await;
+    // The qualified `source/name` is the identity. It cannot collide with a
+    // built-in, so it is always safe to register.
+    let qualified = plugin.manifest.qualified_name();
+    engine
+        .register_node_type_as(&qualified, factory.clone())
+        .await;
+
+    // The bare name is a convenience alias for flows written before
+    // namespacing. Register it ONLY if nothing already holds it: a plugin that
+    // silently displaced a built-in (or another plugin) would take over every
+    // flow using that node type, and the failure looks like success.
+    let bare = plugin.manifest.name.as_str();
+    if engine.has_node_type(bare).await {
+        tracing::warn!(
+            plugin = %qualified,
+            bare = %bare,
+            "bare node type already registered — refusing to shadow it; reference this plugin as '{qualified}'"
+        );
+    } else {
+        engine.register_node_type_as(bare, factory).await;
+    }
 
     Ok(())
 }

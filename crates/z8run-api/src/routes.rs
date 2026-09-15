@@ -48,6 +48,71 @@ pub fn public_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health_check))
         .route("/info", get(server_info))
+        .route("/nodes", get(list_nodes))
+}
+
+/// GET /api/v1/nodes
+///
+/// Every node type the engine will accept, with the plugin schemas the editor
+/// has no other way to learn: the frontend's palette is a hardcoded list, so a
+/// plugin's description, category, ports and parameter aliases are otherwise
+/// invisible.
+///
+/// Built-ins are reported as bare type names. Their descriptions live in the
+/// frontend's own `NODE_DEFINITIONS`, not in Rust, so there is nothing here to
+/// serve — the client already has them and merges on `type`.
+async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let plugins = state.plugins.list().await;
+
+    let mut plugin_types: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut nodes = Vec::new();
+
+    for p in &plugins {
+        let m = &p.manifest;
+        let qualified = m.qualified_name();
+        plugin_types.insert(qualified.clone());
+
+        // The bare name is only an alias when nothing else claimed it — ask the
+        // engine rather than assume, so the answer matches what will resolve.
+        let bare_is_alias =
+            state.engine.node_type_identity(&m.name).await.as_deref() == Some(qualified.as_str());
+
+        nodes.push(serde_json::json!({
+            "type": qualified,
+            "kind": "plugin",
+            "name": m.name,
+            "source": m.source,
+            "version": m.version,
+            "description": m.description,
+            "author": m.author,
+            "category": m.category,
+            "icon": m.icon,
+            "inputs": m.inputs.iter().map(|i| serde_json::json!({
+                "name": i.name, "type": i.port_type,
+                "description": i.description, "required": i.required,
+            })).collect::<Vec<_>>(),
+            "outputs": m.outputs.iter().map(|o| serde_json::json!({
+                "name": o.name, "type": o.port_type, "description": o.description,
+            })).collect::<Vec<_>>(),
+            "params": m.params.iter().map(|(canonical, spec)| serde_json::json!({
+                "name": canonical,
+                "aliases": spec.aliases,
+                "deprecated": spec.deprecated,
+                "description": spec.description,
+            })).collect::<Vec<_>>(),
+            "aliases": if bare_is_alias { vec![m.name.clone()] } else { Vec::new() },
+        }));
+    }
+
+    for t in state.engine.registered_node_types().await {
+        // Skip both the qualified plugin types and their bare aliases.
+        if plugin_types.contains(&t) || plugins.iter().any(|p| p.manifest.name == t) {
+            continue;
+        }
+        nodes.push(serde_json::json!({ "type": t, "kind": "builtin" }));
+    }
+
+    Json(serde_json::json!({ "nodes": nodes, "total": nodes.len() }))
 }
 
 /// Mounts hook routes: /hook/{flow_id} and /hook/{flow_id}/{*path}
@@ -385,8 +450,13 @@ async fn start_flow(
         .map_err(ApiError::from)?;
 
     // Build an executable Flow from canvas state (returns id_map for frontend feedback)
-    let (exec_flow, id_map) =
-        canvas_to_flow(&stored_flow, claims.sub, state.vault.as_ref()).await?;
+    let (exec_flow, id_map) = canvas_to_flow(
+        &stored_flow,
+        claims.sub,
+        state.vault.as_ref(),
+        Some(state.plugins.as_ref()),
+    )
+    .await?;
 
     info!(
         flow_id = %id,
@@ -551,6 +621,7 @@ async fn canvas_to_flow(
     stored: &Flow,
     user_id: Uuid,
     vault: &dyn CredentialVault,
+    plugins: Option<&z8run_runtime::PluginRegistry>,
 ) -> Result<(Flow, std::collections::HashMap<String, Uuid>), ApiError> {
     let canvas_nodes = stored
         .metadata
@@ -623,6 +694,28 @@ async fn canvas_to_flow(
         // Pass the node config (resolve vault references under the flow owner)
         if let Some(config) = data.get("config") {
             let resolved = resolve_vault_refs(config.clone(), user_id, vault).await;
+
+            // Rewrite aliased parameter names to canonical BEFORE the node sees
+            // them. Doing it here rather than inside each node means one
+            // implementation covers plugins and built-ins alike, and a node
+            // compiled before a rename keeps working without being rebuilt.
+            //
+            // This is the only place `with_config` is called, so it is the only
+            // place this hook is needed.
+            let resolved = match plugins {
+                Some(reg) => match reg.get_by_node_type(node_type_str).await {
+                    Some(plugin) => {
+                        let (rewritten, warnings) = plugin.manifest.apply_param_aliases(resolved);
+                        for w in warnings {
+                            warn!(node = %canvas_id, node_type = %node_type_str, "{w}");
+                        }
+                        rewritten
+                    }
+                    None => resolved,
+                },
+                None => resolved,
+            };
+
             core_node = core_node.with_config(resolved);
         }
 
@@ -1007,8 +1100,13 @@ async fn hook_handler(
     }
 
     // Build executable flow (vault refs resolved under the flow owner)
-    let (exec_flow, _id_map) = match canvas_to_flow(&stored_flow, owner_id, state.vault.as_ref())
-        .await
+    let (exec_flow, _id_map) = match canvas_to_flow(
+        &stored_flow,
+        owner_id,
+        state.vault.as_ref(),
+        Some(state.plugins.as_ref()),
+    )
+    .await
     {
         Ok(result) => result,
         Err(e) => {
