@@ -307,6 +307,18 @@ async fn cmd_serve(
     z8run_core::nodes::register_builtin_nodes(&state.engine).await;
     tracing::info!("Built-in nodes registered");
 
+    // Hand the scanned plugins to the engine.
+    //
+    // `registry.scan()` earlier only populates the plugin REGISTRY; it does not
+    // tell the engine anything. `register_plugins` already existed and did the
+    // whole job — it was simply never called, so every installed plugin was
+    // discovered at startup and then unusable, and any flow referencing one was
+    // rejected with "unsupported node types".
+    match z8run_runtime::register_plugins(&state.engine, &registry).await {
+        Ok(n) => tracing::info!(plugins = n, "Plugins registered with engine"),
+        Err(e) => tracing::warn!(error = %e, "Plugin registration with engine failed"),
+    }
+
     // Build router
     let app = z8run_api::build_router(state);
 

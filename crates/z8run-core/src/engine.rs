@@ -285,6 +285,24 @@ impl FlowEngine {
         self.node_registry.write().await.insert(node_type, factory);
     }
 
+    /// Is this node type registered?
+    ///
+    /// Built-in types are a compile-time list, but WASM plugins only exist at
+    /// runtime — anything validating a flow has to ask the engine rather than
+    /// consult a hardcoded array, or a perfectly loadable plugin is rejected as
+    /// unsupported.
+    pub async fn has_node_type(&self, node_type: &str) -> bool {
+        self.node_registry.read().await.contains_key(node_type)
+    }
+
+    /// Every registered node type, sorted. For diagnostics and for error
+    /// messages that should tell the caller what IS available.
+    pub async fn registered_node_types(&self) -> Vec<String> {
+        let mut types: Vec<String> = self.node_registry.read().await.keys().cloned().collect();
+        types.sort();
+        types
+    }
+
     /// Subscribes to engine events.
     pub fn subscribe_events(&self) -> broadcast::Receiver<EngineEvent> {
         self.event_tx.subscribe()

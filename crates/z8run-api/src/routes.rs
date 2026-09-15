@@ -1250,7 +1250,13 @@ async fn import_flow(
 
         for node in canvas_nodes {
             let node_type = node["data"]["type"].as_str().unwrap_or("unknown");
-            if !VALID_NODE_TYPES.contains(&node_type) {
+            // VALID_NODE_TYPES covers the built-ins, which are known at compile
+            // time. WASM plugins are registered at startup and cannot be in a
+            // const, so ask the engine too — otherwise an installed, loadable
+            // plugin is rejected as an unsupported type.
+            if !VALID_NODE_TYPES.contains(&node_type)
+                && !state.engine.has_node_type(node_type).await
+            {
                 unknown_types.push(node_type.to_string());
             }
         }
@@ -1259,10 +1265,14 @@ async fn import_flow(
             // Deduplicate
             unknown_types.sort();
             unknown_types.dedup();
+            // Report what is ACTUALLY available, plugins included. The old
+            // message listed only the const, so an installed plugin looked
+            // like it did not exist.
+            let available = state.engine.registered_node_types().await;
             return Err(ApiError::bad_request(format!(
                 "Flow contains unsupported node types: {}. Supported types: {}",
                 unknown_types.join(", "),
-                VALID_NODE_TYPES.join(", "),
+                available.join(", "),
             )));
         }
     }
