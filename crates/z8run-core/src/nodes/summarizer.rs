@@ -48,18 +48,18 @@ impl NodeExecutor for SummarizerNode {
             "Summarization request"
         );
 
-        let client = reqwest::Client::new();
+        let client = crate::egress::client();
         let timeout = std::time::Duration::from_millis(self.timeout_ms);
 
         let summary_result = match self.strategy.as_str() {
             "map-reduce" => {
                 if text.len() > 4000 {
-                    self.summarize_map_reduce(&client, &text, timeout).await
+                    self.summarize_map_reduce(client, &text, timeout).await
                 } else {
-                    self.summarize_simple(&client, &text, timeout).await
+                    self.summarize_simple(client, &text, timeout).await
                 }
             }
-            _ => self.summarize_simple(&client, &text, timeout).await,
+            _ => self.summarize_simple(client, &text, timeout).await,
         };
 
         match summary_result {
@@ -129,7 +129,7 @@ impl SummarizerNode {
     /// Simple summarization: send entire text to LLM.
     async fn summarize_simple(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         text: &str,
         timeout: std::time::Duration,
     ) -> Result<String, String> {
@@ -164,7 +164,7 @@ impl SummarizerNode {
     /// Map-reduce summarization: split text, summarize chunks, then summarize summaries.
     async fn summarize_map_reduce(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         text: &str,
         timeout: std::time::Duration,
     ) -> Result<String, String> {

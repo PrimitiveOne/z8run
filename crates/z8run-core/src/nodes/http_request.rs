@@ -66,6 +66,29 @@ pub struct HttpRequestNode {
     timeout_ms: u64,
 }
 
+impl HttpRequestNode {
+    fn error_output(
+        &self,
+        msg: &FlowMessage,
+        url: &str,
+        error: &str,
+        timeout: bool,
+    ) -> FlowMessage {
+        warn!(
+            node = %self.name,
+            error = %error,
+            url = %sanitize_url(url),
+            "HTTP Request failed"
+        );
+        let payload = serde_json::json!({
+            "error": error,
+            "url": url,
+            "timeout": timeout,
+        });
+        msg.derive(msg.source_node, "error", payload)
+    }
+}
+
 #[async_trait::async_trait]
 impl NodeExecutor for HttpRequestNode {
     async fn process(&self, msg: FlowMessage) -> Z8Result<Vec<FlowMessage>> {
@@ -79,16 +102,28 @@ impl NodeExecutor for HttpRequestNode {
             "HTTP Request outbound"
         );
 
-        let client = reqwest::Client::new();
+        let client = crate::egress::client();
+        let method = match self.method.as_str() {
+            "POST" => reqwest::Method::POST,
+            "PUT" => reqwest::Method::PUT,
+            "PATCH" => reqwest::Method::PATCH,
+            "DELETE" => reqwest::Method::DELETE,
+            "HEAD" => reqwest::Method::HEAD,
+            _ => reqwest::Method::GET,
+        };
 
-        // Build request with method
-        let mut request = match self.method.as_str() {
-            "POST" => client.post(&resolved_url),
-            "PUT" => client.put(&resolved_url),
-            "PATCH" => client.patch(&resolved_url),
-            "DELETE" => client.delete(&resolved_url),
-            "HEAD" => client.head(&resolved_url),
-            _ => client.get(&resolved_url),
+        // Refused destinations (egress policy, bad URL) go out the error port
+        // like any other request failure.
+        let mut request = match client.request(method, &resolved_url) {
+            Ok(request) => request,
+            Err(e) => {
+                return Ok(vec![self.error_output(
+                    &msg,
+                    &resolved_url,
+                    &e.to_string(),
+                    false,
+                )])
+            }
         };
 
         // Set timeout
@@ -128,8 +163,19 @@ impl NodeExecutor for HttpRequestNode {
                     })
                     .collect();
 
-                // Parse response body as JSON, fallback to string
-                let body_text = response.text().await.unwrap_or_default();
+                // Parse response body as JSON, fallback to string. Bodies over
+                // the egress size cap are reported on the error port.
+                let body_text = match client.read_text(response).await {
+                    Ok(text) => text,
+                    Err(e) => {
+                        return Ok(vec![self.error_output(
+                            &msg,
+                            &resolved_url,
+                            &e.to_string(),
+                            false,
+                        )]);
+                    }
+                };
                 let body_json: serde_json::Value =
                     serde_json::from_str(&body_text).unwrap_or(if body_text.is_empty() {
                         serde_json::Value::Null
@@ -154,24 +200,12 @@ impl NodeExecutor for HttpRequestNode {
                 let out = msg.derive(msg.source_node, "response", payload);
                 Ok(vec![out])
             }
-            Err(e) => {
-                warn!(
-                    node = %self.name,
-                    error = %e,
-                    url = %sanitize_url(&resolved_url),
-                    "HTTP Request failed"
-                );
-
-                let is_timeout = e.is_timeout();
-                let error_payload = serde_json::json!({
-                    "error": e.to_string(),
-                    "url": resolved_url,
-                    "timeout": is_timeout,
-                });
-
-                let out = msg.derive(msg.source_node, "error", error_payload);
-                Ok(vec![out])
-            }
+            Err(e) => Ok(vec![self.error_output(
+                &msg,
+                &resolved_url,
+                &crate::egress::describe(&e),
+                e.is_timeout(),
+            )]),
         }
     }
 
@@ -250,6 +284,38 @@ mod tests {
     fn test_sanitize_url_drops_userinfo() {
         let url = "https://user:pass@api.example.com/path?x=1";
         assert_eq!(sanitize_url(url), "https://api.example.com/path");
+    }
+
+    #[tokio::test]
+    async fn internal_destinations_go_to_the_error_port() {
+        // Default (strict) policy: the URL template can't be steered at
+        // cloud metadata or loopback.
+        for target in [
+            "169.254.169.254/latest/meta-data",
+            "localhost:7700/api/v1/flows",
+        ] {
+            let node = HttpRequestNode {
+                name: "req".into(),
+                url: "http://{req.body.target}".into(),
+                method: "GET".into(),
+                headers: serde_json::json!({}),
+                body_path: String::new(),
+                timeout_ms: 2000,
+            };
+            let msg = FlowMessage::new(
+                uuid::Uuid::now_v7(),
+                "out",
+                serde_json::json!({ "req": { "body": { "target": target } } }),
+                uuid::Uuid::now_v7(),
+            );
+            let out = node.process(msg).await.unwrap();
+            assert_eq!(out[0].source_port, "error", "{target}");
+            let error = out[0].payload["error"].as_str().unwrap();
+            assert!(
+                error.contains("blocked by the egress policy"),
+                "{target}: {error}"
+            );
+        }
     }
 
     #[test]

@@ -183,7 +183,7 @@ impl CrmNode {
     }
 
     async fn execute_hubspot(&self, msg: &FlowMessage) -> Z8Result<Vec<FlowMessage>> {
-        let client = reqwest::Client::new();
+        let client = crate::egress::client();
         let base = "https://api.hubapi.com";
 
         match self.action.as_str() {
@@ -194,7 +194,7 @@ impl CrmNode {
                 info!(node = %self.name, action = "create_contact", "Executing HubSpot action");
 
                 let resp = client
-                    .post(format!("{}/crm/v3/objects/contacts", base))
+                    .post(format!("{}/crm/v3/objects/contacts", base))?
                     .bearer_auth(&self.api_key)
                     .json(&body)
                     .timeout(std::time::Duration::from_millis(self.timeout_ms))
@@ -204,7 +204,7 @@ impl CrmNode {
                 match resp {
                     Ok(response) => {
                         let status = response.status().as_u16();
-                        let body_text = response.text().await.unwrap_or_default();
+                        let body_text = client.read_text(response).await.unwrap_or_default();
                         let body_json: Value =
                             serde_json::from_str(&body_text).unwrap_or(Value::String(body_text));
 
@@ -246,7 +246,7 @@ impl CrmNode {
                 info!(node = %self.name, action = "update_contact", contact_id = %contact_id, "Executing HubSpot action");
 
                 let resp = client
-                    .patch(format!("{}/crm/v3/objects/contacts/{}", base, contact_id))
+                    .patch(format!("{}/crm/v3/objects/contacts/{}", base, contact_id))?
                     .bearer_auth(&self.api_key)
                     .json(&body)
                     .timeout(std::time::Duration::from_millis(self.timeout_ms))
@@ -256,7 +256,7 @@ impl CrmNode {
                 match resp {
                     Ok(response) => {
                         let status = response.status().as_u16();
-                        let body_text = response.text().await.unwrap_or_default();
+                        let body_text = client.read_text(response).await.unwrap_or_default();
                         let body_json: Value =
                             serde_json::from_str(&body_text).unwrap_or(Value::String(body_text));
 
@@ -298,7 +298,7 @@ impl CrmNode {
                     .get(format!(
                         "{}/crm/v3/objects/contacts/{}?properties=email,firstname,lastname,phone,company",
                         base, contact_id
-                    ))
+                    ))?
                     .bearer_auth(&self.api_key)
                     .timeout(std::time::Duration::from_millis(self.timeout_ms))
                     .send()
@@ -307,7 +307,7 @@ impl CrmNode {
                 match resp {
                     Ok(response) => {
                         let status = response.status().as_u16();
-                        let body_text = response.text().await.unwrap_or_default();
+                        let body_text = client.read_text(response).await.unwrap_or_default();
                         let body_json: Value =
                             serde_json::from_str(&body_text).unwrap_or(Value::String(body_text));
 
@@ -358,7 +358,7 @@ impl CrmNode {
                 info!(node = %self.name, action = "search_contacts", "Executing HubSpot action");
 
                 let resp = client
-                    .post(format!("{}/crm/v3/objects/contacts/search", base))
+                    .post(format!("{}/crm/v3/objects/contacts/search", base))?
                     .bearer_auth(&self.api_key)
                     .json(&body)
                     .timeout(std::time::Duration::from_millis(self.timeout_ms))
@@ -368,7 +368,7 @@ impl CrmNode {
                 match resp {
                     Ok(response) => {
                         let status = response.status().as_u16();
-                        let body_text = response.text().await.unwrap_or_default();
+                        let body_text = client.read_text(response).await.unwrap_or_default();
                         let body_json: Value =
                             serde_json::from_str(&body_text).unwrap_or(Value::String(body_text));
 
@@ -404,7 +404,7 @@ impl CrmNode {
                 info!(node = %self.name, action = "create_deal", "Executing HubSpot action");
 
                 let resp = client
-                    .post(format!("{}/crm/v3/objects/deals", base))
+                    .post(format!("{}/crm/v3/objects/deals", base))?
                     .bearer_auth(&self.api_key)
                     .json(&body)
                     .timeout(std::time::Duration::from_millis(self.timeout_ms))
@@ -414,7 +414,7 @@ impl CrmNode {
                 match resp {
                     Ok(response) => {
                         let status = response.status().as_u16();
-                        let body_text = response.text().await.unwrap_or_default();
+                        let body_text = client.read_text(response).await.unwrap_or_default();
                         let body_json: Value =
                             serde_json::from_str(&body_text).unwrap_or(Value::String(body_text));
 
@@ -447,7 +447,7 @@ impl CrmNode {
                 info!(node = %self.name, action = "list_deals", "Executing HubSpot action");
 
                 let resp = client
-                    .get(format!("{}/crm/v3/objects/deals?limit=100", base))
+                    .get(format!("{}/crm/v3/objects/deals?limit=100", base))?
                     .bearer_auth(&self.api_key)
                     .timeout(std::time::Duration::from_millis(self.timeout_ms))
                     .send()
@@ -456,7 +456,7 @@ impl CrmNode {
                 match resp {
                     Ok(response) => {
                         let status = response.status().as_u16();
-                        let body_text = response.text().await.unwrap_or_default();
+                        let body_text = client.read_text(response).await.unwrap_or_default();
                         let body_json: Value =
                             serde_json::from_str(&body_text).unwrap_or(Value::String(body_text));
 
@@ -496,7 +496,7 @@ impl CrmNode {
     }
 
     async fn execute_salesforce(&self, msg: &FlowMessage) -> Z8Result<Vec<FlowMessage>> {
-        let client = reqwest::Client::new();
+        let client = crate::egress::client();
         let base = &self.base_url;
 
         match self.action.as_str() {
@@ -506,7 +506,7 @@ impl CrmNode {
                 info!(node = %self.name, action = "create_contact", "Executing Salesforce action");
 
                 let resp = client
-                    .post(format!("{}/services/data/v59.0/sobjects/Contact", base))
+                    .post(format!("{}/services/data/v59.0/sobjects/Contact", base))?
                     .bearer_auth(&self.api_key)
                     .json(&body)
                     .timeout(std::time::Duration::from_millis(self.timeout_ms))
@@ -516,7 +516,7 @@ impl CrmNode {
                 match resp {
                     Ok(response) => {
                         let status = response.status().as_u16();
-                        let body_text = response.text().await.unwrap_or_default();
+                        let body_text = client.read_text(response).await.unwrap_or_default();
                         let body_json: Value =
                             serde_json::from_str(&body_text).unwrap_or(Value::String(body_text));
 
@@ -560,7 +560,7 @@ impl CrmNode {
                     .patch(format!(
                         "{}/services/data/v59.0/sobjects/Contact/{}",
                         base, contact_id
-                    ))
+                    ))?
                     .bearer_auth(&self.api_key)
                     .json(&body)
                     .timeout(std::time::Duration::from_millis(self.timeout_ms))
@@ -570,7 +570,7 @@ impl CrmNode {
                 match resp {
                     Ok(response) => {
                         let status = response.status().as_u16();
-                        let body_text = response.text().await.unwrap_or_default();
+                        let body_text = client.read_text(response).await.unwrap_or_default();
                         let body_json: Value =
                             serde_json::from_str(&body_text).unwrap_or(Value::String(body_text));
 
@@ -612,7 +612,7 @@ impl CrmNode {
                     .get(format!(
                         "{}/services/data/v59.0/sobjects/Contact/{}",
                         base, contact_id
-                    ))
+                    ))?
                     .bearer_auth(&self.api_key)
                     .timeout(std::time::Duration::from_millis(self.timeout_ms))
                     .send()
@@ -621,7 +621,7 @@ impl CrmNode {
                 match resp {
                     Ok(response) => {
                         let status = response.status().as_u16();
-                        let body_text = response.text().await.unwrap_or_default();
+                        let body_text = client.read_text(response).await.unwrap_or_default();
                         let body_json: Value =
                             serde_json::from_str(&body_text).unwrap_or(Value::String(body_text));
 
@@ -667,7 +667,7 @@ impl CrmNode {
                         "{}/services/data/v59.0/query/?q={}",
                         base,
                         urlencoding::encode(&query)
-                    ))
+                    ))?
                     .bearer_auth(&self.api_key)
                     .timeout(std::time::Duration::from_millis(self.timeout_ms))
                     .send()
@@ -676,7 +676,7 @@ impl CrmNode {
                 match resp {
                     Ok(response) => {
                         let status = response.status().as_u16();
-                        let body_text = response.text().await.unwrap_or_default();
+                        let body_text = client.read_text(response).await.unwrap_or_default();
                         let body_json: Value =
                             serde_json::from_str(&body_text).unwrap_or(Value::String(body_text));
 
@@ -711,7 +711,7 @@ impl CrmNode {
                 info!(node = %self.name, action = "create_deal", "Executing Salesforce action");
 
                 let resp = client
-                    .post(format!("{}/services/data/v59.0/sobjects/Opportunity", base))
+                    .post(format!("{}/services/data/v59.0/sobjects/Opportunity", base))?
                     .bearer_auth(&self.api_key)
                     .json(&body)
                     .timeout(std::time::Duration::from_millis(self.timeout_ms))
@@ -721,7 +721,7 @@ impl CrmNode {
                 match resp {
                     Ok(response) => {
                         let status = response.status().as_u16();
-                        let body_text = response.text().await.unwrap_or_default();
+                        let body_text = client.read_text(response).await.unwrap_or_default();
                         let body_json: Value =
                             serde_json::from_str(&body_text).unwrap_or(Value::String(body_text));
 
@@ -760,7 +760,7 @@ impl CrmNode {
                         "{}/services/data/v59.0/query/?q={}",
                         base,
                         urlencoding::encode(query)
-                    ))
+                    ))?
                     .bearer_auth(&self.api_key)
                     .timeout(std::time::Duration::from_millis(self.timeout_ms))
                     .send()
@@ -769,7 +769,7 @@ impl CrmNode {
                 match resp {
                     Ok(response) => {
                         let status = response.status().as_u16();
-                        let body_text = response.text().await.unwrap_or_default();
+                        let body_text = client.read_text(response).await.unwrap_or_default();
                         let body_json: Value =
                             serde_json::from_str(&body_text).unwrap_or(Value::String(body_text));
 

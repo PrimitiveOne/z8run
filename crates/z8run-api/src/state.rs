@@ -26,6 +26,8 @@ pub struct AppState {
     pub port: u16,
     /// Hook response channels keyed by trace_id.
     pub webhook_responders: WebhookResponders,
+    /// Body, concurrency and time limits for public hooks (A-06).
+    pub hook_limits: crate::hook_limits::HookLimits,
 }
 
 impl AppState {
@@ -58,6 +60,7 @@ impl AppState {
             jwt_secret,
             port,
             webhook_responders: responders,
+            hook_limits: crate::hook_limits::HookLimits::from_env(),
         }
     }
 }

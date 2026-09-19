@@ -65,7 +65,7 @@ impl NodeExecutor for LlmNode {
             "LLM request"
         );
 
-        let client = reqwest::Client::new();
+        let client = crate::egress::client();
         let timeout = std::time::Duration::from_millis(self.timeout_ms);
 
         let flow_id = msg.trace_id;
@@ -75,7 +75,7 @@ impl NodeExecutor for LlmNode {
             match self.provider.as_str() {
                 "anthropic" => {
                     self.stream_anthropic(
-                        &client,
+                        client,
                         &prompt,
                         image.as_deref(),
                         timeout,
@@ -85,40 +85,26 @@ impl NodeExecutor for LlmNode {
                     .await
                 }
                 "ollama" => {
-                    self.stream_ollama(
-                        &client,
-                        &prompt,
-                        image.as_deref(),
-                        timeout,
-                        flow_id,
-                        node_id,
-                    )
-                    .await
+                    self.stream_ollama(client, &prompt, image.as_deref(), timeout, flow_id, node_id)
+                        .await
                 }
                 _ => {
-                    self.stream_openai(
-                        &client,
-                        &prompt,
-                        image.as_deref(),
-                        timeout,
-                        flow_id,
-                        node_id,
-                    )
-                    .await
+                    self.stream_openai(client, &prompt, image.as_deref(), timeout, flow_id, node_id)
+                        .await
                 }
             }
         } else {
             match self.provider.as_str() {
                 "anthropic" => {
-                    self.call_anthropic(&client, &prompt, image.as_deref(), timeout)
+                    self.call_anthropic(client, &prompt, image.as_deref(), timeout)
                         .await
                 }
                 "ollama" => {
-                    self.call_ollama(&client, &prompt, image.as_deref(), timeout)
+                    self.call_ollama(client, &prompt, image.as_deref(), timeout)
                         .await
                 }
                 _ => {
-                    self.call_openai(&client, &prompt, image.as_deref(), timeout)
+                    self.call_openai(client, &prompt, image.as_deref(), timeout)
                         .await
                 }
             }
@@ -186,7 +172,7 @@ impl NodeExecutor for LlmNode {
 impl LlmNode {
     async fn call_openai(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         prompt: &str,
         image: Option<&str>,
         timeout: std::time::Duration,
@@ -211,7 +197,7 @@ impl LlmNode {
         });
 
         let resp = client
-            .post(&url)
+            .post(&url)?
             .bearer_auth(&self.api_key)
             .header("Content-Type", "application/json")
             .timeout(timeout)
@@ -221,8 +207,8 @@ impl LlmNode {
             .map_err(|e| format!("OpenAI request failed: {}", e))?;
 
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
+        let text = client
+            .read_text(resp)
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
 
@@ -241,7 +227,7 @@ impl LlmNode {
 
     async fn call_anthropic(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         prompt: &str,
         image: Option<&str>,
         timeout: std::time::Duration,
@@ -260,7 +246,7 @@ impl LlmNode {
         }
 
         let resp = client
-            .post(&url)
+            .post(&url)?
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
@@ -271,8 +257,8 @@ impl LlmNode {
             .map_err(|e| format!("Anthropic request failed: {}", e))?;
 
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
+        let text = client
+            .read_text(resp)
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
 
@@ -292,7 +278,7 @@ impl LlmNode {
 
     async fn call_ollama(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         prompt: &str,
         image: Option<&str>,
         timeout: std::time::Duration,
@@ -316,7 +302,7 @@ impl LlmNode {
         });
 
         let resp = client
-            .post(&url)
+            .post(&url)?
             .header("Content-Type", "application/json")
             .timeout(timeout)
             .json(&body)
@@ -325,8 +311,8 @@ impl LlmNode {
             .map_err(|e| format!("Ollama request failed: {}", e))?;
 
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
+        let text = client
+            .read_text(resp)
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
 
@@ -345,7 +331,7 @@ impl LlmNode {
 
     async fn stream_openai(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         prompt: &str,
         image: Option<&str>,
         timeout: std::time::Duration,
@@ -373,7 +359,7 @@ impl LlmNode {
         });
 
         let resp = client
-            .post(&url)
+            .post(&url)?
             .bearer_auth(&self.api_key)
             .header("Content-Type", "application/json")
             .timeout(timeout)
@@ -384,8 +370,8 @@ impl LlmNode {
 
         let status = resp.status().as_u16();
         if status != 200 {
-            let text = resp
-                .text()
+            let text = client
+                .read_text(resp)
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("OpenAI API error ({}): {}", status, text));
@@ -435,7 +421,7 @@ impl LlmNode {
 
     async fn stream_anthropic(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         prompt: &str,
         image: Option<&str>,
         timeout: std::time::Duration,
@@ -457,7 +443,7 @@ impl LlmNode {
         }
 
         let resp = client
-            .post(&url)
+            .post(&url)?
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
@@ -469,8 +455,8 @@ impl LlmNode {
 
         let status = resp.status().as_u16();
         if status != 200 {
-            let text = resp
-                .text()
+            let text = client
+                .read_text(resp)
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("Anthropic API error ({}): {}", status, text));
@@ -525,7 +511,7 @@ impl LlmNode {
 
     async fn stream_ollama(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         prompt: &str,
         image: Option<&str>,
         timeout: std::time::Duration,
@@ -551,7 +537,7 @@ impl LlmNode {
         });
 
         let resp = client
-            .post(&url)
+            .post(&url)?
             .header("Content-Type", "application/json")
             .timeout(timeout)
             .json(&body)
@@ -561,8 +547,8 @@ impl LlmNode {
 
         let status = resp.status().as_u16();
         if status != 200 {
-            let text = resp
-                .text()
+            let text = client
+                .read_text(resp)
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("Ollama API error ({}): {}", status, text));

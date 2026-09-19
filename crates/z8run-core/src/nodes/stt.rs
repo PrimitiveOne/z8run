@@ -47,20 +47,20 @@ impl NodeExecutor for SttNode {
             "STT request"
         );
 
-        let client = reqwest::Client::new();
+        let client = crate::egress::client();
         let timeout = std::time::Duration::from_millis(self.timeout_ms);
 
         let result = match self.provider.as_str() {
             "deepgram" => {
-                self.call_deepgram(&client, &audio_data, &audio_format, &language, timeout)
+                self.call_deepgram(client, &audio_data, &audio_format, &language, timeout)
                     .await
             }
             "google" => {
-                self.call_google(&client, &audio_data, &language, timeout)
+                self.call_google(client, &audio_data, &language, timeout)
                     .await
             }
             _ => {
-                self.call_openai(&client, &audio_data, &language, timeout)
+                self.call_openai(client, &audio_data, &language, timeout)
                     .await
             } // default to OpenAI
         };
@@ -125,7 +125,7 @@ impl SttNode {
     /// Call OpenAI Whisper API for transcription
     async fn call_openai(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         audio_data: &[u8],
         language: &str,
         timeout: std::time::Duration,
@@ -153,7 +153,7 @@ impl SttNode {
         };
 
         let resp = client
-            .post(url)
+            .post(url)?
             .bearer_auth(&self.api_key)
             .timeout(timeout)
             .multipart(form)
@@ -162,8 +162,8 @@ impl SttNode {
             .map_err(|e| format!("OpenAI request failed: {}", e))?;
 
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
+        let text = client
+            .read_text(resp)
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
 
@@ -193,7 +193,7 @@ impl SttNode {
     /// Call Deepgram API for transcription
     async fn call_deepgram(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         audio_data: &[u8],
         audio_format: &str,
         language: &str,
@@ -213,7 +213,7 @@ impl SttNode {
         }
 
         let resp = client
-            .post(&url)
+            .post(&url)?
             .header("Authorization", format!("Token {}", self.api_key))
             .header("Content-Type", audio_format)
             .timeout(timeout)
@@ -223,8 +223,8 @@ impl SttNode {
             .map_err(|e| format!("Deepgram request failed: {}", e))?;
 
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
+        let text = client
+            .read_text(resp)
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
 
@@ -263,7 +263,7 @@ impl SttNode {
     /// Call Google Cloud Speech-to-Text API for transcription
     async fn call_google(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         audio_data: &[u8],
         language: &str,
         timeout: std::time::Duration,
@@ -285,7 +285,7 @@ impl SttNode {
         });
 
         let resp = client
-            .post(url)
+            .post(url)?
             .header("Content-Type", "application/json")
             .header("X-Goog-Api-Key", &self.api_key)
             .timeout(timeout)
@@ -295,8 +295,8 @@ impl SttNode {
             .map_err(|e| format!("Google request failed: {}", e))?;
 
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
+        let text = client
+            .read_text(resp)
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
 

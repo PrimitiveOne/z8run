@@ -72,17 +72,13 @@ impl SensitivePatterns {
         for pattern_name in enabled_patterns {
             match pattern_name.as_str() {
                 "credit_card" => {
-                    result = self
-                        .credit_card
-                        .replace_all(&result, "****-****-****-$0")
-                        .to_string();
-                    // Better: keep last 4 digits
+                    // Keep only the last 4 digits.
                     result = self
                         .credit_card
                         .replace_all(&result, |caps: &regex::Captures| {
                             let full = caps[0].replace([' ', '-'], "");
-                            if full.len() >= 4 {
-                                format!("****-****-****-{}", &full[full.len() - 4..])
+                            if full.chars().count() >= 4 {
+                                format!("****-****-****-{}", last_chars(&full, 4))
                             } else {
                                 "****-****-****-****".to_string()
                             }
@@ -97,8 +93,10 @@ impl SensitivePatterns {
                             if let Some(at_idx) = email.find('@') {
                                 let local = &email[..at_idx];
                                 let domain = &email[at_idx..];
-                                if local.len() > 2 {
-                                    format!("{}***{}", &local[..1], domain)
+                                let mut chars = local.chars();
+                                if local.chars().count() > 2 {
+                                    let first = chars.next().unwrap_or('*');
+                                    format!("{first}***{domain}")
                                 } else {
                                     format!("***{}", domain)
                                 }
@@ -119,8 +117,8 @@ impl SensitivePatterns {
                         .phone
                         .replace_all(&result, |caps: &regex::Captures| {
                             let num = caps[0].replace([' ', '-', '(', ')'], "");
-                            if num.len() >= 4 {
-                                format!("***{}", &num[num.len() - 4..])
+                            if num.chars().count() >= 4 {
+                                format!("***{}", last_chars(&num, 4))
                             } else {
                                 "***".to_string()
                             }
@@ -148,6 +146,12 @@ impl SensitivePatterns {
     }
 }
 
+/// Last `n` characters of `s` (not bytes).
+fn last_chars(s: &str, n: usize) -> String {
+    let count = s.chars().count();
+    s.chars().skip(count.saturating_sub(n)).collect()
+}
+
 /// Apply the sanitization strategy to a single value.
 fn apply_strategy(value: &Value, strategy: &str) -> Value {
     match strategy {
@@ -167,19 +171,19 @@ fn apply_strategy(value: &Value, strategy: &str) -> Value {
             // Mask: show first and last few chars
             match value {
                 Value::String(s) => {
-                    let len = s.len();
+                    // Count and slice by characters: byte indices would split
+                    // multibyte text and panic (same class as audit A-07).
+                    let chars: Vec<char> = s.chars().collect();
+                    let len = chars.len();
                     if len <= 4 {
                         Value::String("****".to_string())
                     } else if len <= 8 {
-                        Value::String(format!("{}***", &s[..1]))
+                        Value::String(format!("{}***", chars[0]))
                     } else {
-                        let visible_start = std::cmp::min(3, len / 4);
-                        let visible_end = std::cmp::min(3, len / 4);
-                        Value::String(format!(
-                            "{}***{}",
-                            &s[..visible_start],
-                            &s[len - visible_end..]
-                        ))
+                        let visible = std::cmp::min(3, len / 4);
+                        let head: String = chars[..visible].iter().collect();
+                        let tail: String = chars[len - visible..].iter().collect();
+                        Value::String(format!("{head}***{tail}"))
                     }
                 }
                 Value::Number(_) => Value::String("***".to_string()),
@@ -461,5 +465,50 @@ mod tests {
         let result = node.process(msg).await.unwrap();
         assert!(result[0].payload["secret"].is_null());
         assert_eq!(result[0].payload["public"], "visible");
+    }
+
+    /// Masking must slice by characters, not bytes: non-ASCII values must not
+    /// panic and must keep whole characters (same class as audit A-07).
+    #[test]
+    fn test_mask_non_ascii_does_not_panic() {
+        for input in ["élodie", "ñandú-largo-ñandú", "😀😀😀😀😀😀😀😀😀😀"]
+        {
+            let out = apply_strategy(&Value::String(input.to_string()), "mask");
+            assert!(out.as_str().unwrap().contains("***"), "{input} -> {out}");
+        }
+        // 9 characters -> 2 visible at each end, whole characters kept.
+        assert_eq!(
+            apply_strategy(&Value::String("日本語のテキスト値".to_string()), "mask"),
+            Value::String("日本***ト値".to_string())
+        );
+    }
+
+    /// `\d` is Unicode-aware, so card/phone numbers can be multibyte digits
+    /// (Arabic-Indic: 2 bytes, Devanagari: 3 bytes). Keep the last 4 DIGITS.
+    #[test]
+    fn test_card_and_phone_with_unicode_digits() {
+        let patterns = SensitivePatterns::new();
+        let card = vec!["credit_card".to_string()];
+        assert_eq!(
+            patterns.apply("card ٠١٢٣ ٤٥٦٧ ٨٩٠١ ٢٣٤٥ end", &card),
+            "card ****-****-****-٢٣٤٥ end"
+        );
+        assert_eq!(
+            patterns.apply("card ०१२३ ४५६७ ८९०१ २३४५ end", &card),
+            "card ****-****-****-२३४५ end"
+        );
+        let out = patterns.apply("call ९१ ९८७६ ५४३२ १०९८ now", &["phone".to_string()]);
+        assert!(
+            out.contains("***१०९८"),
+            "phone not masked to its last 4 digits"
+        );
+    }
+
+    /// A card number is masked once, with a single "****-****-****-" prefix.
+    #[test]
+    fn test_credit_card_masked_once() {
+        let patterns = SensitivePatterns::new();
+        let out = patterns.apply("card 1234 5678 9012 3456 end", &["credit_card".to_string()]);
+        assert_eq!(out, "card ****-****-****-3456 end");
     }
 }

@@ -160,9 +160,12 @@ pub struct LoginRequest {
 }
 
 /// Response payload for auth success.
+///
+/// The session JWT travels only in the HttpOnly `z8_session` cookie, never in
+/// the body, so page scripts can't read it (A-09). Non-browser clients can
+/// take the token from the `Set-Cookie` header and send it as a Bearer token.
 #[derive(Debug, Serialize)]
 pub struct AuthResponse {
-    pub token: String,
     pub user: UserInfo,
 }
 
@@ -243,7 +246,6 @@ async fn register(
     let token = encode_jwt(&claims, &state.jwt_secret)?;
 
     let body = AuthResponse {
-        token: token.clone(),
         user: UserInfo {
             id: user_id.to_string(),
             email: payload.email,
@@ -293,7 +295,6 @@ async fn login(
     let token = encode_jwt(&claims, &state.jwt_secret)?;
 
     let body = AuthResponse {
-        token: token.clone(),
         user: UserInfo {
             id: user.id.to_string(),
             email: user.email,

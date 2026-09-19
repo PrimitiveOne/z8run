@@ -4,6 +4,7 @@
 //! This crate contains the data model, flow compiler,
 //! scheduler, and motor executor.
 
+pub mod egress;
 pub mod engine;
 pub mod error;
 pub mod flow;

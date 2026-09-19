@@ -28,6 +28,18 @@ jobs:
       - name: Cache Cargo registry & build
         uses: Swatinem/rust-cache@v2
 
+      # --all-features includes embed-ui, which compiles frontend/dist in.
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build web UI
+        working-directory: frontend
+        run: npm ci && npm run build
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -39,6 +51,24 @@ jobs:
 
       - name: Run tests
         run: cargo test --all
+
+  # Windows: the standalone binary targets it (#78). Covers paths, the
+  # per-user data directory and SQLite URLs, which Linux can't exercise.
+  windows:
+    name: Windows (CLI)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test CLI
+        run: cargo test -p z8run-cli
 
   # Frontend
   frontend:

@@ -48,13 +48,13 @@ impl NodeExecutor for TtsNode {
             "TTS request"
         );
 
-        let client = reqwest::Client::new();
+        let client = crate::egress::client();
         let timeout = std::time::Duration::from_millis(self.timeout_ms);
 
         let result = match self.provider.as_str() {
-            "elevenlabs" => self.call_elevenlabs(&client, &text, &voice, timeout).await,
-            "google" => self.call_google(&client, &text, &voice, timeout).await,
-            _ => self.call_openai(&client, &text, &voice, timeout).await, // default to OpenAI
+            "elevenlabs" => self.call_elevenlabs(client, &text, &voice, timeout).await,
+            "google" => self.call_google(client, &text, &voice, timeout).await,
+            _ => self.call_openai(client, &text, &voice, timeout).await, // default to OpenAI
         };
 
         match result {
@@ -114,7 +114,7 @@ impl TtsNode {
     /// Call OpenAI Text-to-Speech API
     async fn call_openai(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         text: &str,
         voice: &str,
         timeout: std::time::Duration,
@@ -140,7 +140,7 @@ impl TtsNode {
         });
 
         let resp = client
-            .post(url)
+            .post(url)?
             .bearer_auth(&self.api_key)
             .header("Content-Type", "application/json")
             .timeout(timeout)
@@ -152,15 +152,15 @@ impl TtsNode {
         let status = resp.status().as_u16();
 
         if status != 200 {
-            let text = resp
-                .text()
+            let text = client
+                .read_text(resp)
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("OpenAI TTS API error ({}): {}", status, text));
         }
 
-        let audio_bytes = resp
-            .bytes()
+        let audio_bytes = client
+            .read_bytes(resp)
             .await
             .map_err(|e| format!("Failed to read audio response: {}", e))?;
 
@@ -179,7 +179,7 @@ impl TtsNode {
     /// Call ElevenLabs Text-to-Speech API
     async fn call_elevenlabs(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         text: &str,
         voice: &str,
         timeout: std::time::Duration,
@@ -204,7 +204,7 @@ impl TtsNode {
         });
 
         let resp = client
-            .post(&url)
+            .post(&url)?
             .header("xi-api-key", &self.api_key)
             .header("Content-Type", "application/json")
             .timeout(timeout)
@@ -216,15 +216,15 @@ impl TtsNode {
         let status = resp.status().as_u16();
 
         if status != 200 {
-            let text = resp
-                .text()
+            let text = client
+                .read_text(resp)
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(format!("ElevenLabs TTS API error ({}): {}", status, text));
         }
 
-        let audio_bytes = resp
-            .bytes()
+        let audio_bytes = client
+            .read_bytes(resp)
             .await
             .map_err(|e| format!("Failed to read audio response: {}", e))?;
 
@@ -243,7 +243,7 @@ impl TtsNode {
     /// Call Google Cloud Text-to-Speech API
     async fn call_google(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         text: &str,
         voice: &str,
         timeout: std::time::Duration,
@@ -276,7 +276,7 @@ impl TtsNode {
         });
 
         let resp = client
-            .post(url)
+            .post(url)?
             .header("Content-Type", "application/json")
             .header("X-Goog-Api-Key", &self.api_key)
             .timeout(timeout)
@@ -286,8 +286,8 @@ impl TtsNode {
             .map_err(|e| format!("Google TTS request failed: {}", e))?;
 
         let status = resp.status().as_u16();
-        let response_text = resp
-            .text()
+        let response_text = client
+            .read_text(resp)
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
 

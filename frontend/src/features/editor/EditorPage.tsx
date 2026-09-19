@@ -59,6 +59,7 @@ function EditorInner() {
         });
         const edges = (flow.canvas_edges ?? []) as Edge[];
         setFlow(flow.id, flow.name, nodes, edges);
+        useFlowStore.getState().setDeployed(flow.deployed === true);
       })
       .catch((err: unknown) => {
         // A malformed flow response (e.g. failed runtime validation) or a

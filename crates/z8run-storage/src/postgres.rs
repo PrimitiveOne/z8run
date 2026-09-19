@@ -6,7 +6,8 @@ use uuid::Uuid;
 use z8run_core::flow::Flow;
 
 use crate::repository::{
-    ExecutionRecord, ExecutionRepository, FlowRepository, HookRoute, UserRecord, UserRepository,
+    ExecutionRecord, ExecutionRepository, FlowRepository, HookMatch, HookRoute, UserRecord,
+    UserRepository,
 };
 use crate::StorageError;
 
@@ -120,7 +121,7 @@ impl FlowRepository for PgStorage {
             return Err(StorageError::FlowNotFound(id));
         }
 
-        self.delete_hook_routes(id).await?;
+        self.undeploy_flow(id).await?;
 
         tracing::debug!(flow_id = %id, "Flow deleted from PostgreSQL");
         Ok(())
@@ -231,7 +232,7 @@ impl FlowRepository for PgStorage {
             return Err(StorageError::FlowNotFound(id));
         }
 
-        self.delete_hook_routes(id).await?;
+        self.undeploy_flow(id).await?;
 
         tracing::debug!(flow_id = %id, user_id = %user_id, "Flow deleted");
         Ok(())
@@ -254,15 +255,19 @@ impl FlowRepository for PgStorage {
         }
     }
 
-    async fn replace_hook_routes(
+    async fn deploy_flow(
         &self,
         flow_id: Uuid,
         user_id: Uuid,
+        snapshot: &Flow,
         routes: &[HookRoute],
     ) -> Result<(), StorageError> {
         let flow_id_str = flow_id.to_string();
         let user_id_str = user_id.to_string();
+        let snapshot_json = serde_json::to_value(snapshot)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
+        // Snapshot and routes change together or not at all.
         let mut tx = self.pool.begin().await?;
 
         sqlx::query("DELETE FROM hook_routes WHERE flow_id = $1")
@@ -270,15 +275,30 @@ impl FlowRepository for PgStorage {
             .execute(&mut *tx)
             .await?;
 
+        sqlx::query(
+            r#"INSERT INTO flow_deployments (flow_id, user_id, snapshot, deployed_at)
+               VALUES ($1, $2, $3, NOW())
+               ON CONFLICT(flow_id) DO UPDATE SET
+                   user_id = EXCLUDED.user_id,
+                   snapshot = EXCLUDED.snapshot,
+                   deployed_at = EXCLUDED.deployed_at"#,
+        )
+        .bind(&flow_id_str)
+        .bind(&user_id_str)
+        .bind(&snapshot_json)
+        .execute(&mut *tx)
+        .await?;
+
         for route in routes {
             sqlx::query(
-                r#"INSERT INTO hook_routes (flow_id, user_id, method, path, node_type, created_at)
-                   VALUES ($1, $2, $3, $4, $5, NOW())"#,
+                r#"INSERT INTO hook_routes (flow_id, user_id, method, path, node_id, node_type, created_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, NOW())"#,
             )
             .bind(&flow_id_str)
             .bind(&user_id_str)
             .bind(&route.method)
             .bind(&route.path)
+            .bind(&route.node_id)
             .bind(&route.node_type)
             .execute(&mut *tx)
             .await?;
@@ -293,31 +313,51 @@ impl FlowRepository for PgStorage {
         flow_id: Uuid,
         method: &str,
         path: &str,
-    ) -> Result<Option<Uuid>, StorageError> {
-        let flow_id_str = flow_id.to_string();
-
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT user_id FROM hook_routes WHERE flow_id = $1 AND method = $2 AND path = $3",
+    ) -> Result<Option<HookMatch>, StorageError> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT user_id, node_id FROM hook_routes WHERE flow_id = $1 AND method = $2 AND path = $3",
         )
-        .bind(&flow_id_str)
+        .bind(flow_id.to_string())
         .bind(method)
         .bind(path)
         .fetch_optional(&self.pool)
         .await?;
 
         match row {
-            Some((uid,)) => Ok(Some(
-                Uuid::parse_str(&uid).map_err(|e| StorageError::Serialization(e.to_string()))?,
-            )),
+            Some((uid, node_id)) => Ok(Some(HookMatch {
+                user_id: Uuid::parse_str(&uid)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?,
+                node_id,
+            })),
             None => Ok(None),
         }
     }
 
-    async fn delete_hook_routes(&self, flow_id: Uuid) -> Result<(), StorageError> {
+    async fn get_deployment(&self, flow_id: Uuid) -> Result<Option<Flow>, StorageError> {
+        let row: Option<(serde_json::Value,)> =
+            sqlx::query_as("SELECT snapshot FROM flow_deployments WHERE flow_id = $1")
+                .bind(flow_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+
+        row.map(|(json,)| {
+            serde_json::from_value(json).map_err(|e| StorageError::Serialization(e.to_string()))
+        })
+        .transpose()
+    }
+
+    async fn undeploy_flow(&self, flow_id: Uuid) -> Result<(), StorageError> {
+        let flow_id_str = flow_id.to_string();
+        let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM hook_routes WHERE flow_id = $1")
-            .bind(flow_id.to_string())
-            .execute(&self.pool)
+            .bind(&flow_id_str)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM flow_deployments WHERE flow_id = $1")
+            .bind(&flow_id_str)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 }

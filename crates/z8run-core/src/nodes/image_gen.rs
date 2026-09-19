@@ -47,12 +47,12 @@ impl NodeExecutor for ImageGenNode {
             "Image generation request"
         );
 
-        let client = reqwest::Client::new();
+        let client = crate::egress::client();
         let timeout = std::time::Duration::from_millis(self.timeout_ms);
 
         let result = match self.provider.as_str() {
-            "stability" => self.call_stability(&client, &prompt, timeout).await,
-            _ => self.call_openai(&client, &prompt, timeout).await, // default to OpenAI
+            "stability" => self.call_stability(client, &prompt, timeout).await,
+            _ => self.call_openai(client, &prompt, timeout).await, // default to OpenAI
         };
 
         match result {
@@ -106,7 +106,7 @@ impl NodeExecutor for ImageGenNode {
 impl ImageGenNode {
     async fn call_openai(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         prompt: &str,
         timeout: std::time::Duration,
     ) -> Result<serde_json::Value, String> {
@@ -127,7 +127,7 @@ impl ImageGenNode {
         });
 
         let resp = client
-            .post(&url)
+            .post(&url)?
             .bearer_auth(&self.api_key)
             .header("Content-Type", "application/json")
             .timeout(timeout)
@@ -137,8 +137,8 @@ impl ImageGenNode {
             .map_err(|e| format!("OpenAI request failed: {}", e))?;
 
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
+        let text = client
+            .read_text(resp)
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
 
@@ -176,7 +176,7 @@ impl ImageGenNode {
 
     async fn call_stability(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         prompt: &str,
         timeout: std::time::Duration,
     ) -> Result<serde_json::Value, String> {
@@ -205,7 +205,7 @@ impl ImageGenNode {
         });
 
         let resp = client
-            .post(&url)
+            .post(&url)?
             .bearer_auth(&self.api_key)
             .header("Content-Type", "application/json")
             .timeout(timeout)
@@ -215,8 +215,8 @@ impl ImageGenNode {
             .map_err(|e| format!("Stability request failed: {}", e))?;
 
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
+        let text = client
+            .read_text(resp)
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
 

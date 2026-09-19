@@ -166,19 +166,22 @@ impl CancelHandle {
     }
 }
 
-/// Execution state of an active flow.
+/// Execution state of one running execution of a flow.
 struct ActiveFlow {
+    /// Flow this execution belongs to.
+    flow_id: Uuid,
     _flow: Flow,
     _plan: ExecutionPlan,
     status: FlowStatus,
-    _trace_id: Uuid,
     /// Handle used by [`FlowEngine::stop`] to cancel the running driver task.
     cancel: CancelHandle,
 }
 
 /// z8run flow execution engine.
 pub struct FlowEngine {
-    /// Active flows currently executing.
+    /// Executions in progress, keyed by trace id. A flow can run several times
+    /// concurrently (e.g. parallel webhook calls), so keying by flow id would
+    /// let executions overwrite and remove each other's entries.
     active_flows: Arc<RwLock<HashMap<Uuid, ActiveFlow>>>,
     /// Broadcast channel to emit engine events.
     event_tx: broadcast::Sender<EngineEvent>,
@@ -197,9 +200,103 @@ pub trait NodeExecutorFactory: Send + Sync {
     fn node_type(&self) -> &str;
 }
 
+/// Returns the longest prefix of `s` that is at most `max` bytes and ends on
+/// a UTF-8 character boundary, so slicing never splits a multibyte char (A-07).
+fn truncate_utf8(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Keys whose values are secrets and must never appear in previews. Compared
+/// case-insensitively with `-` normalized to `_`, by EXACT name so that fields
+/// like `total_tokens` or `max_tokens` are not over-redacted.
+const SENSITIVE_PREVIEW_KEYS: &[&str] = &[
+    "authorization",
+    "proxy_authorization",
+    "cookie",
+    "set_cookie",
+    "x_api_key",
+    "api_key",
+    "apikey",
+    "x_auth_token",
+    "auth_token",
+    "authtoken",
+    "password",
+    "passwd",
+    "secret",
+    "client_secret",
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "private_key",
+    "x_signature",
+    "x_hub_signature",
+    "x_hub_signature_256",
+];
+
+fn is_sensitive_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace('-', "_");
+    SENSITIVE_PREVIEW_KEYS.contains(&normalized.as_str())
+}
+
+/// `scheme://user:password@` → `scheme://user:***@`.
+static URL_USERINFO: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s/:@]+):[^\s/@]+@").unwrap()
+});
+
+/// Values of secret-bearing query parameters (`?token=...&api_key=...`).
+static SECRET_QUERY_PARAM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)([?&](?:token|access_token|api_key|apikey|key|secret|password|signature|sig|auth)=)[^&\s#]*",
+    )
+    .unwrap()
+});
+
+/// Returns a copy of `value` with secrets removed, for previews only (A-09).
+///
+/// Previews reach the UI through engine events, so headers such as
+/// `Authorization`/`Cookie` and credentials embedded in URLs are masked here.
+/// The functional payload that nodes pass along is never modified.
+fn redact_preview(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    let redacted = if is_sensitive_key(k) {
+                        Value::String("[REDACTED]".to_string())
+                    } else {
+                        redact_preview(v)
+                    };
+                    (k.clone(), redacted)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(redact_preview).collect()),
+        Value::String(s) => {
+            let s = URL_USERINFO.replace_all(s, "$1:***@");
+            Value::String(SECRET_QUERY_PARAM.replace_all(&s, "$1***").into_owned())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Builds the UI preview of a payload: secrets redacted, then size-bounded.
+fn truncate_payload(value: &serde_json::Value) -> serde_json::Value {
+    let redacted = redact_preview(value);
+    truncate_redacted(&redacted)
+}
+
 /// Truncate a JSON payload for UI preview (max ~500 chars).
 /// Deeply nested objects get replaced with a summary.
-fn truncate_payload(value: &serde_json::Value) -> serde_json::Value {
+fn truncate_redacted(value: &serde_json::Value) -> serde_json::Value {
     let s = value.to_string();
     if s.len() <= 500 {
         return value.clone();
@@ -212,7 +309,7 @@ fn truncate_payload(value: &serde_json::Value) -> serde_json::Value {
             if vs.len() > 100 {
                 preview.insert(
                     k.clone(),
-                    serde_json::Value::String(format!("{}...", &vs[..97])),
+                    serde_json::Value::String(format!("{}...", truncate_utf8(&vs, 97))),
                 );
             } else {
                 preview.insert(k.clone(), v.clone());
@@ -227,7 +324,7 @@ fn truncate_payload(value: &serde_json::Value) -> serde_json::Value {
         serde_json::Value::Object(preview)
     } else {
         // For non-objects, just truncate the string
-        serde_json::Value::String(format!("{}...", &s[..497]))
+        serde_json::Value::String(format!("{}...", truncate_utf8(&s, 497)))
     }
 }
 
@@ -345,12 +442,12 @@ impl FlowEngine {
         {
             let mut active = self.active_flows.write().await;
             active.insert(
-                flow_id,
+                trace_id,
                 ActiveFlow {
+                    flow_id,
                     _flow: flow.clone(),
                     _plan: plan.clone(),
                     status: FlowStatus::Running,
-                    _trace_id: trace_id,
                     cancel: cancel.clone(),
                 },
             );
@@ -388,7 +485,9 @@ impl FlowEngine {
                             trace_id,
                             duration_ms,
                         });
-                        engine.set_flow_status(flow_id, FlowStatus::Completed).await;
+                        engine
+                            .set_execution_status(trace_id, FlowStatus::Completed)
+                            .await;
                     }
                     Err(e) => {
                         error!(error = %e, "Flow failed");
@@ -397,7 +496,9 @@ impl FlowEngine {
                             trace_id,
                             error: e.to_string(),
                         });
-                        engine.set_flow_status(flow_id, FlowStatus::Error).await;
+                        engine
+                            .set_execution_status(trace_id, FlowStatus::Error)
+                            .await;
                     }
                 }
             }
@@ -407,7 +508,7 @@ impl FlowEngine {
             // broadcast. Remove it from the active set so the map does not grow
             // unbounded and `active_flow_ids()` reports only genuinely-active
             // flows.
-            engine.remove_flow(flow_id).await;
+            engine.remove_execution(trace_id).await;
         });
 
         Ok(trace_id)
@@ -639,15 +740,32 @@ impl FlowEngine {
     /// nodes and aborts any in-flight ones (FUNC-004). The driver task then
     /// removes the flow from the active set (FUNC-005).
     pub async fn stop(&self, flow_id: Uuid) -> Z8Result<()> {
-        // Trigger cancellation while holding only a read lock; `cancel()` just
-        // flips an atomic flag and notifies, so it cannot deadlock against the
-        // driver's removal (which takes a write lock afterwards).
-        if let Some(af) = self.active_flows.read().await.get(&flow_id) {
-            af.cancel.cancel();
+        // Cancel EVERY in-flight execution of this flow, not just the latest.
+        // `cancel()` only flips an atomic flag and notifies, so holding the
+        // write lock here cannot deadlock against the driver's removal.
+        let mut cancelled = 0;
+        for af in self.active_flows.write().await.values_mut() {
+            if af.flow_id == flow_id {
+                af.cancel.cancel();
+                af.status = FlowStatus::Stopped;
+                cancelled += 1;
+            }
         }
-        self.set_flow_status(flow_id, FlowStatus::Stopped).await;
-        info!(flow_id = %flow_id, "Flow stopped");
+        info!(flow_id = %flow_id, executions = cancelled, "Flow stopped");
         Ok(())
+    }
+
+    /// Cancels a single execution by trace id (e.g. when its webhook caller
+    /// timed out). Returns `false` if it had already finished.
+    pub async fn cancel_execution(&self, trace_id: Uuid) -> bool {
+        match self.active_flows.write().await.get_mut(&trace_id) {
+            Some(af) => {
+                af.cancel.cancel();
+                af.status = FlowStatus::Stopped;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Returns the state of an active flow.
@@ -655,17 +773,20 @@ impl FlowEngine {
         self.active_flows
             .read()
             .await
-            .get(&flow_id)
+            .values()
+            .find(|af| af.flow_id == flow_id)
             .map(|af| af.status.clone())
     }
 
-    /// Returns the IDs of all active flows.
+    /// Returns the IDs of flows with at least one execution in progress.
     pub async fn active_flow_ids(&self) -> Vec<Uuid> {
-        self.active_flows.read().await.keys().cloned().collect()
+        let active = self.active_flows.read().await;
+        let ids: std::collections::HashSet<Uuid> = active.values().map(|af| af.flow_id).collect();
+        ids.into_iter().collect()
     }
 
-    async fn set_flow_status(&self, flow_id: Uuid, status: FlowStatus) {
-        if let Some(af) = self.active_flows.write().await.get_mut(&flow_id) {
+    async fn set_execution_status(&self, trace_id: Uuid, status: FlowStatus) {
+        if let Some(af) = self.active_flows.write().await.get_mut(&trace_id) {
             af.status = status;
         }
     }
@@ -673,8 +794,8 @@ impl FlowEngine {
     /// Removes a flow from the active set once it has reached a terminal state
     /// (FUNC-005). Called by the driver task after all terminal events have
     /// been emitted.
-    async fn remove_flow(&self, flow_id: Uuid) {
-        self.active_flows.write().await.remove(&flow_id);
+    async fn remove_execution(&self, trace_id: Uuid) {
+        self.active_flows.write().await.remove(&trace_id);
     }
 
     fn clone_refs(&self) -> Self {
@@ -842,5 +963,66 @@ mod tests {
             from_c, 2,
             "fan-in node forwarded {from_c} of 2 inputs (must process every message)"
         );
+    }
+
+    /// A-07: previews are cut by byte index; a multibyte character straddling
+    /// the cut must not panic. Covers both thresholds (non-object at 497,
+    /// object values at 97).
+    #[test]
+    fn truncate_payload_handles_multibyte_at_both_thresholds() {
+        // Non-object: `"` + 495 ASCII puts the 2-byte 'é' across byte 497.
+        let long = serde_json::Value::String(format!("{}é{}", "a".repeat(495), "b".repeat(100)));
+        let out = truncate_payload(&long);
+        let text = out.as_str().expect("string preview");
+        assert!(text.ends_with("..."));
+        assert!(text.len() <= 500);
+
+        // Object value: `"` + 95 ASCII puts the 4-byte emoji across byte 97.
+        let value = format!("{}\u{1F600}{}", "a".repeat(95), "b".repeat(500));
+        let obj = serde_json::json!({ "k": value });
+        let out = truncate_payload(&obj);
+        let preview = out["k"].as_str().expect("truncated value");
+        assert!(preview.ends_with("..."));
+        assert!(preview.len() <= 100);
+    }
+
+    /// A-09: previews shown in the UI must not leak credentials, but must keep
+    /// ordinary data (including look-alike keys such as `total_tokens`).
+    #[test]
+    fn preview_redacts_secrets_but_keeps_data() {
+        let payload = serde_json::json!({
+            "headers": {
+                "Authorization": "Bearer abc",
+                "cookie": "z8_session=xyz",
+                "X-Api-Key": "k-123",
+                "accept": "application/json"
+            },
+            "url": "https://bob:hunter2@api.example.com/v1?token=t0k&q=search",
+            "usage": { "total_tokens": 42, "max_tokens": 100 },
+            "items": [{ "password": "p", "name": "keep" }]
+        });
+
+        let preview = truncate_payload(&payload);
+        let text = preview.to_string();
+        for (i, secret) in ["abc", "xyz", "k-123", "hunter2", "t0k", "\"p\""]
+            .iter()
+            .enumerate()
+        {
+            // Don't echo the secret into test output; its index is enough.
+            assert!(
+                !text.contains(secret),
+                "secret #{i} leaked into the preview"
+            );
+        }
+        assert_eq!(preview["headers"]["accept"], "application/json");
+        assert_eq!(preview["usage"]["total_tokens"], 42);
+        assert_eq!(preview["items"][0]["name"], "keep");
+        assert_eq!(
+            preview["url"],
+            "https://bob:***@api.example.com/v1?token=***&q=search"
+        );
+
+        // The functional payload is untouched.
+        assert_eq!(payload["headers"]["Authorization"], "Bearer abc");
     }
 }

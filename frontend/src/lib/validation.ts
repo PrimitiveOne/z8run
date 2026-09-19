@@ -21,15 +21,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /**
  * Validate a login/register response before it is trusted and stored.
- * Requires a string `token` and a `user` object carrying the expected fields.
+ * Requires a `user` object carrying the expected fields. The session token is
+ * NOT part of the body: it lives only in the HttpOnly cookie (A-09).
  * Throws a descriptive Error on any mismatch.
  */
 export function assertAuthResponse(value: unknown): AuthResponse {
   if (!isRecord(value)) {
     throw new Error("Invalid auth response: expected an object");
-  }
-  if (typeof value.token !== "string" || value.token.length === 0) {
-    throw new Error("Invalid auth response: missing or non-string 'token'");
   }
   const user = value.user;
   if (!isRecord(user)) {

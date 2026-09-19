@@ -43,31 +43,44 @@ pub trait FlowRepository: Send + Sync {
     /// hook path to scope credential resolution to the flow's owner.
     async fn get_flow_owner(&self, id: Uuid) -> Result<Option<Uuid>, StorageError>;
 
-    /// Replaces the persisted hook routes for a flow (used on deploy).
+    /// Deploys a flow: atomically replaces its immutable snapshot and its hook
+    /// routes.
     ///
-    /// All existing routes for `flow_id` are removed and the provided set is
-    /// inserted, so a re-deploy always reflects the current canvas.
-    async fn replace_hook_routes(
+    /// Hooks execute `snapshot`, never the live (editable) flow, so editing the
+    /// canvas cannot change what a published URL runs until the next deploy.
+    async fn deploy_flow(
         &self,
         flow_id: Uuid,
         user_id: Uuid,
+        snapshot: &Flow,
         routes: &[HookRoute],
     ) -> Result<(), StorageError>;
 
     /// Finds a deployed hook route matching `flow_id` + `method` + `path`.
     ///
-    /// Returns the owner `user_id` when a matching route exists, or `None`
-    /// when the flow is not deployed for that method/path. The public hook
-    /// handler uses this to reject unauthorized or mismatched requests.
+    /// Returns the owner and the trigger node bound to the route, or `None`
+    /// when the flow is not deployed for that method/path.
     async fn find_hook_route(
         &self,
         flow_id: Uuid,
         method: &str,
         path: &str,
-    ) -> Result<Option<Uuid>, StorageError>;
+    ) -> Result<Option<HookMatch>, StorageError>;
 
-    /// Removes all hook routes for a flow (used on undeploy/delete).
-    async fn delete_hook_routes(&self, flow_id: Uuid) -> Result<(), StorageError>;
+    /// Returns the deployed snapshot of a flow, if it is deployed.
+    async fn get_deployment(&self, flow_id: Uuid) -> Result<Option<Flow>, StorageError>;
+
+    /// Removes a flow's deployment snapshot and all of its hook routes.
+    async fn undeploy_flow(&self, flow_id: Uuid) -> Result<(), StorageError>;
+}
+
+/// A matched hook route: who owns it and which trigger node it is bound to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookMatch {
+    /// Owner of the deployed flow (scopes vault access).
+    pub user_id: Uuid,
+    /// Canvas id of the trigger node that declared the route.
+    pub node_id: String,
 }
 
 /// A single HTTP entry point a deployed flow exposes under `/hook/{flow_id}`.
@@ -77,6 +90,8 @@ pub struct HookRoute {
     pub method: String,
     /// Normalized sub-path (e.g. `/` or `/branch`).
     pub path: String,
+    /// Canvas id of the trigger node that declared this route.
+    pub node_id: String,
     /// Canvas node type that declared this route (e.g. `http-in`).
     pub node_type: String,
 }

@@ -10,6 +10,10 @@ readme = "README.md"
 keywords = ["api", "axum", "websocket", "rest", "jwt"]
 categories = ["web-programming::http-server", "authentication"]
 
+[features]
+# Compile the built web UI (frontend/dist) into the binary; see build.rs.
+embed-ui = []
+
 [dependencies]
 z8run-core = { workspace = true }
 z8run-protocol = { workspace = true }
@@ -35,3 +39,7 @@ base64 = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+ipnet = { workspace = true }
+
+[dev-dependencies]
+sqlx = { workspace = true }

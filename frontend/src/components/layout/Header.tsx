@@ -24,6 +24,11 @@ export function Header() {
   const saveFlow = useFlowStore((s) => s.saveFlow);
   const setFlowName = useFlowStore((s) => s.setFlowName);
   const running = useEngineStore((s) => s.running);
+  const deployed = useFlowStore((s) => s.deployed);
+  const setDeployed = useFlowStore((s) => s.setDeployed);
+  // A deployed hook flow is idle between requests, so it must be stoppable
+  // even when nothing is executing right now.
+  const canStop = running || deployed;
   const wsConnected = useEngineStore((s) => s.connected);
   const reactFlow = useReactFlow();
 
@@ -108,6 +113,15 @@ export function Header() {
             {wsConnected ? "Connected" : "Disconnected"}
           </span>
         </div>
+
+        {deployed && (
+          <span
+            className="ml-2 px-1.5 py-0.5 text-[10px] font-medium rounded bg-green-900/40 text-green-400 border border-green-800"
+            title="Public hooks are live. Stop to take them offline."
+          >
+            Deployed
+          </span>
+        )}
       </div>
 
       {/* Right: actions */}
@@ -174,6 +188,8 @@ export function Header() {
               // Clear old mapping so new events get queued until fresh map arrives
               useEngineStore.getState().setNodeMap({});
               const res = await flowsApi.start(flowId);
+              // Hook flows stay live after deploy; run-once flows don't.
+              setDeployed(res.status === "deployed");
               if (res.node_map) {
                 useEngineStore.getState().setNodeMap(res.node_map);
               }
@@ -215,17 +231,21 @@ export function Header() {
         </button>
         <button
           type="button"
-          disabled={!running || !flowId}
+          disabled={!canStop || !flowId}
+          title={
+            deployed ? "Stop and take the public hooks offline" : undefined
+          }
           onClick={async () => {
             if (!flowId) return;
             try {
               await flowsApi.stop(flowId);
+              setDeployed(false);
             } catch (err) {
               console.error("Stop failed:", err);
             }
           }}
           className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors ${
-            running
+            canStop
               ? "text-red-300 hover:bg-red-900/30"
               : "text-slate-600 cursor-not-allowed"
           }`}

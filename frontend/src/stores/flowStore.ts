@@ -21,6 +21,8 @@ interface FlowState {
   dirty: boolean;
   saveError: string | null;
   loadError: string | null;
+  /** True while the flow's public hooks are live on the server. */
+  deployed: boolean;
 
   // React Flow state
   nodes: Node<Z8NodeData>[];
@@ -42,6 +44,7 @@ interface FlowState {
   resetAllNodeStatus: () => void;
   setFlowName: (name: string) => void;
   setLoadError: (message: string | null) => void;
+  setDeployed: (deployed: boolean) => void;
   removeSelected: () => void;
   clear: () => void;
   saveFlow: (viewport: { x: number; y: number; zoom: number }) => Promise<void>;
@@ -56,6 +59,7 @@ export const useFlowStore = create<FlowState>((set, get) => ({
   dirty: false,
   saveError: null,
   loadError: null,
+  deployed: false,
   nodes: [],
   edges: [],
 
@@ -70,11 +74,21 @@ export const useFlowStore = create<FlowState>((set, get) => ({
       loadError: null,
     }),
 
+  // React Flow reports measurements and selection as changes too (e.g. on
+  // mount); only real edits should mark the flow as unsaved.
   onNodesChange: (changes) =>
-    set({ nodes: applyNodeChanges(changes, get().nodes), dirty: true }),
+    set({
+      nodes: applyNodeChanges(changes, get().nodes),
+      dirty:
+        get().dirty ||
+        changes.some((c) => c.type !== "dimensions" && c.type !== "select"),
+    }),
 
   onEdgesChange: (changes) =>
-    set({ edges: applyEdgeChanges(changes, get().edges), dirty: true }),
+    set({
+      edges: applyEdgeChanges(changes, get().edges),
+      dirty: get().dirty || changes.some((c) => c.type !== "select"),
+    }),
 
   onConnect: (connection) =>
     set({
@@ -97,6 +111,8 @@ export const useFlowStore = create<FlowState>((set, get) => ({
   setFlowName: (name) => set({ flowName: name, dirty: true }),
 
   setLoadError: (message) => set({ loadError: message }),
+
+  setDeployed: (deployed) => set({ deployed }),
 
   updateNodeData: (id, data) =>
     set({
@@ -135,6 +151,7 @@ export const useFlowStore = create<FlowState>((set, get) => ({
       nodes: [],
       edges: [],
       dirty: false,
+      deployed: false,
       saveError: null,
       loadError: null,
     }),

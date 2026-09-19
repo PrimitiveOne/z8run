@@ -72,6 +72,8 @@ export interface FlowDetail {
   description: string;
   version: string;
   status: string;
+  /** True while the flow's public hooks are live (deployed snapshot exists). */
+  deployed?: boolean;
   nodes: unknown[];
   edges: unknown[];
   canvas_nodes: unknown[];

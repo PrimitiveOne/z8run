@@ -7,7 +7,6 @@ members = [
     "crates/z8run-runtime",
     "crates/z8run-api",
     "bins/z8run-cli",
-    "bins/z8run-server",
 ]
 
 [workspace.package]
@@ -70,6 +69,12 @@ futures-util = "0.3"
 # Regex
 regex = "1"
 
+# IP networks (CIDR matching)
+ipnet = "2"
+
+# URL parsing
+url = "2"
+
 # Crypto
 aes-gcm = "0.10"
 rand = "0.8"
@@ -90,9 +95,6 @@ clap = { version = "4.6", features = ["derive", "env"] }
 # Error handling
 thiserror = "2"
 anyhow = "1.0"
-
-# Embed frontend
-rust-embed = "8"
 
 # Config
 config = "0.15"
@@ -121,6 +123,12 @@ opt-level = 3
 lto = "thin"
 strip = true
 codegen-units = 1
+
+# Build scripts and proc-macros only run at compile time and are never
+# shipped. Stripping them breaks proc-macro dylibs on macOS 27 ("mis-aligned
+# LINKEDIT string pool" when rustc loads e.g. sqlx-macros).
+[profile.release.build-override]
+strip = false
 
 [profile.dev]
 opt-level = 0

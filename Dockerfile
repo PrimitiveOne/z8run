@@ -18,7 +18,6 @@ COPY crates/z8run-storage/Cargo.toml    crates/z8run-storage/Cargo.toml
 COPY crates/z8run-protocol/Cargo.toml   crates/z8run-protocol/Cargo.toml
 COPY crates/z8run-runtime/Cargo.toml    crates/z8run-runtime/Cargo.toml
 COPY bins/z8run-cli/Cargo.toml          bins/z8run-cli/Cargo.toml
-COPY bins/z8run-server/Cargo.toml       bins/z8run-server/Cargo.toml
 
 # Create dummy src files so cargo can resolve deps
 RUN mkdir -p crates/z8run-core/src      && echo "" > crates/z8run-core/src/lib.rs && \
@@ -26,8 +25,7 @@ RUN mkdir -p crates/z8run-core/src      && echo "" > crates/z8run-core/src/lib.r
     mkdir -p crates/z8run-storage/src   && echo "" > crates/z8run-storage/src/lib.rs && \
     mkdir -p crates/z8run-protocol/src  && echo "" > crates/z8run-protocol/src/lib.rs && \
     mkdir -p crates/z8run-runtime/src   && echo "" > crates/z8run-runtime/src/lib.rs && \
-    mkdir -p bins/z8run-cli/src         && echo "fn main(){}" > bins/z8run-cli/src/main.rs && \
-    mkdir -p bins/z8run-server/src      && echo "fn main(){}" > bins/z8run-server/src/main.rs
+    mkdir -p bins/z8run-cli/src         && echo "fn main(){}" > bins/z8run-cli/src/main.rs
 
 RUN cargo build --release --bin z8run 2>/dev/null || true
 

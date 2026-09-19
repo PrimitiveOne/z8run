@@ -1,4 +1,6 @@
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+/* Fonts: Inter / JetBrains Mono when installed locally, else the system
+   stack (tailwind.config.ts). No remote font CSS: the CSP only allows
+   same-origin styles, and the standalone binary must work offline. */
 
 @tailwind base;
 @tailwind components;

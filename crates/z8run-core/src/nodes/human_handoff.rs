@@ -364,9 +364,14 @@ impl HumanHandoffNode {
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
 
-        let client = reqwest::Client::new();
-        match client
-            .post(webhook_url)
+        let request = match crate::egress::client().post(webhook_url) {
+            Ok(request) => request,
+            Err(e) => {
+                warn!(node = %self.name, event = event, error = %e, "Webhook notification refused");
+                return;
+            }
+        };
+        match request
             .json(&payload)
             .timeout(std::time::Duration::from_millis(5000))
             .send()

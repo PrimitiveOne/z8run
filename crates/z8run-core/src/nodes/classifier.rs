@@ -62,12 +62,12 @@ impl NodeExecutor for ClassifierNode {
             }
         );
 
-        let client = reqwest::Client::new();
+        let client = crate::egress::client();
         let timeout = std::time::Duration::from_millis(self.timeout_ms);
 
         // Use the same LLM call pattern - reuse OpenAI-compatible API
         let result = call_llm(
-            &client,
+            client,
             &LlmCallParams {
                 provider: &self.provider,
                 model: &self.model,

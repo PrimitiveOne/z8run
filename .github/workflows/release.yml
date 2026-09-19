@@ -1,11 +1,27 @@
 name: Release
 
+# Manual only: Actions -> Release -> Run workflow.
+# Automatic releases on version tags are DISABLED. Re-enabling them needs the
+# `tag` input below to fall back to github.ref_name.
 on:
-  # Automatic release/deploy on version tags is DISABLED.
-  # Re-enable by uncommenting the tags trigger below.
-  # push:
-  #   tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag, e.g. v0.3.0 (created on the selected commit if missing)"
+        required: true
+        type: string
+      draft:
+        description: "Create the GitHub release as a draft"
+        type: boolean
+        default: true
+      docker:
+        description: "Build and push Docker images to GHCR"
+        type: boolean
+        default: false
+      crates:
+        description: "Publish crates to crates.io"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -15,11 +31,26 @@ env:
   REGISTRY: ghcr.io
   IMAGE_Z8RUN: ghcr.io/${{ github.repository }}-api
   IMAGE_NGINX: ghcr.io/${{ github.repository }}-nginx
+  TAG: ${{ inputs.tag }}
 
 jobs:
+  # ── Validate the tag ───────────────────────────────────
+  check:
+    name: Check inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tag must look like vMAJOR.MINOR.PATCH
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::tag '$TAG' must look like v1.2.3 or v1.2.3-rc.1"
+            exit 1
+          fi
+
   # ── Build Docker images with version tag ───────────────
   docker:
     name: Docker Images
+    needs: check
+    if: inputs.docker
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -28,7 +59,7 @@ jobs:
 
       - name: Extract version from tag
         id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        run: echo "VERSION=${TAG#v}" >> $GITHUB_OUTPUT
 
       - name: Log in to GHCR
         uses: docker/login-action@v4
@@ -66,11 +97,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ── Build native binaries ──────────────────────────────
+  # ── Build standalone binaries (web UI embedded) ────────
   binaries:
     name: Build ${{ matrix.target }}
+    needs: check
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -81,10 +113,30 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: z8run-macos-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: z8run-windows-x86_64
+            exe: .exe
+    defaults:
+      run:
+        shell: bash
+    env:
+      BIN: target/${{ matrix.target }}/release/z8run${{ matrix.exe }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build web UI
+        working-directory: frontend
+        run: npm ci && npm run build
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -101,14 +153,47 @@ jobs:
           key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release binary
-        run: cargo build --release --bin z8run --target ${{ matrix.target }}
+        run: cargo build --release --bin z8run --features embed-ui --target ${{ matrix.target }}
 
-      - name: Package binary
+      # Start the real artifact with no configuration and check that both
+      # the API and the embedded editor answer.
+      - name: Smoke test
+        env:
+          Z8_NO_BROWSER: "1"
+        run: |
+          "$BIN" --version
+          # Relative paths: the same for bash and the native binary on Windows.
+          "$BIN" --data-dir z8-smoke serve --port 7799 > z8-smoke.log 2>&1 &
+          pid=$!
+          for _ in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:7799/api/v1/health && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:7799/ | grep -q '<div id="root">'
+          curl -fsS -o /dev/null http://127.0.0.1:7799/flows/smoke
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7799/api/v1/nope)" = 404
+          test -s z8-smoke/secrets/jwt.key
+          kill "$pid" || true
+
+      - name: Show server log
+        if: failure()
+        run: cat z8-smoke.log || true
+
+      - name: Package
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/z8run dist/${{ matrix.artifact }}
-          chmod +x dist/${{ matrix.artifact }}
-          cd dist && shasum -a 256 ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "$BIN" dist/z8run.exe
+            (cd dist && 7z a -tzip ${{ matrix.artifact }}.zip z8run.exe > /dev/null && rm z8run.exe)
+            file=${{ matrix.artifact }}.zip
+          else
+            cp "$BIN" dist/${{ matrix.artifact }}
+            chmod +x dist/${{ matrix.artifact }}
+            file=${{ matrix.artifact }}
+          fi
+          cd dist
+          if command -v sha256sum > /dev/null; then sha256sum "$file"; else shasum -a 256 "$file"; fi > "$file.sha256"
+          cat "$file.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -119,6 +204,8 @@ jobs:
   # ── Publish to crates.io ─────────────────────────────
   crates:
     name: Publish to crates.io
+    needs: check
+    if: inputs.crates
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -162,7 +249,9 @@ jobs:
   # ── Create GitHub Release ──────────────────────────────
   release:
     name: Create Release
-    needs: [docker, binaries, crates]
+    needs: [binaries, docker, crates]
+    # docker/crates may be skipped; any failure stops the release.
+    if: ${{ !cancelled() && needs.binaries.result == 'success' && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -173,6 +262,9 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ inputs.tag }}
+          target_commitish: ${{ github.sha }}
+          draft: ${{ inputs.draft }}
           generate_release_notes: true
           files: |
             artifacts/**/*

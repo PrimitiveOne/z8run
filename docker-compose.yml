@@ -16,6 +16,14 @@ services:
       Z8_RATE_LIMIT_AUTH: "${Z8_RATE_LIMIT_AUTH:-20}"
       Z8_RATE_LIMIT_HOOK: "${Z8_RATE_LIMIT_HOOK:-200}"
       Z8_RATE_LIMIT_WINDOW: "${Z8_RATE_LIMIT_WINDOW:-60}"
+      # Only reachable through nginx (no published port), so its
+      # X-Forwarded-For can be trusted. See deploy/nginx.conf.
+      Z8_TRUST_PROXY: "${Z8_TRUST_PROXY:-true}"
+      Z8_TRUSTED_PROXIES: "${Z8_TRUSTED_PROXIES:-}"
+      # Outbound policy for flows; see .env.example.
+      Z8_EGRESS_POLICY: "${Z8_EGRESS_POLICY:-strict}"
+      Z8_EGRESS_ALLOW: "${Z8_EGRESS_ALLOW:-}"
+      Z8_DB_SQLITE_DIR: "${Z8_DB_SQLITE_DIR:-}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

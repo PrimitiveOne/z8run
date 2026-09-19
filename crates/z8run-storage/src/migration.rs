@@ -122,6 +122,38 @@ CREATE TABLE IF NOT EXISTS hook_routes (
 CREATE INDEX IF NOT EXISTS idx_hook_routes_flow ON hook_routes(flow_id);
 "#;
 
+/// Migration SQL for PostgreSQL V5 (deployment snapshots, A-01/A-05).
+///
+/// Hook routes now record the canvas `node_id` of the trigger that declared
+/// them, so a request is authorized and executed against that exact node. The
+/// deployed flow is kept as an immutable snapshot in `flow_deployments`, so
+/// editing the canvas never changes what a live hook runs until redeploy.
+/// Existing routes carry no node id and are dropped: deployed flows must be
+/// redeployed (fail closed).
+pub const PG_MIGRATION_V5: &str = r#"
+DROP TABLE IF EXISTS hook_routes;
+
+CREATE TABLE hook_routes (
+    flow_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    method TEXT NOT NULL,
+    path TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    node_type TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (flow_id, method, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hook_routes_flow ON hook_routes(flow_id);
+
+CREATE TABLE IF NOT EXISTS flow_deployments (
+    flow_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    snapshot JSONB NOT NULL,
+    deployed_at TIMESTAMPTZ NOT NULL
+);
+"#;
+
 /// Migration SQL for SQLite.
 pub const SQLITE_MIGRATION_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS flows (
@@ -232,6 +264,31 @@ CREATE TABLE IF NOT EXISTS hook_routes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_hook_routes_flow ON hook_routes(flow_id);
+"#;
+
+/// Migration SQL for SQLite V5 (deployment snapshots). See `PG_MIGRATION_V5`.
+pub const SQLITE_MIGRATION_V5: &str = r#"
+DROP TABLE IF EXISTS hook_routes;
+
+CREATE TABLE hook_routes (
+    flow_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    method TEXT NOT NULL,
+    path TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    node_type TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (flow_id, method, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hook_routes_flow ON hook_routes(flow_id);
+
+CREATE TABLE IF NOT EXISTS flow_deployments (
+    flow_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    snapshot TEXT NOT NULL,
+    deployed_at TEXT NOT NULL
+);
 "#;
 
 /// Helper: split SQL into individual statements, strip comments.
@@ -358,6 +415,30 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), StorageError> 
         tracing::debug!("PostgreSQL migration V4 already applied");
     }
 
+    let applied_v5: Option<(i32,)> =
+        sqlx::query_as("SELECT version FROM schema_migrations WHERE version = 5")
+            .fetch_optional(pool)
+            .await?;
+
+    if applied_v5.is_none() {
+        tracing::info!("Applying PostgreSQL migration V5...");
+
+        for stmt in &split_statements(PG_MIGRATION_V5) {
+            sqlx::query(stmt)
+                .execute(pool)
+                .await
+                .map_err(|e| StorageError::Migration(format!("Failed to execute: {}", e)))?;
+        }
+
+        sqlx::query("INSERT INTO schema_migrations (version, applied_at) VALUES (5, NOW())")
+            .execute(pool)
+            .await?;
+
+        tracing::info!("PostgreSQL migration V5 applied successfully");
+    } else {
+        tracing::debug!("PostgreSQL migration V5 already applied");
+    }
+
     Ok(())
 }
 
@@ -480,6 +561,32 @@ pub async fn run_sqlite_migrations(pool: &sqlx::SqlitePool) -> Result<(), Storag
         tracing::info!("SQLite migration V4 applied successfully");
     } else {
         tracing::debug!("SQLite migration V4 already applied");
+    }
+
+    let applied_v5: Option<(i64,)> =
+        sqlx::query_as("SELECT version FROM schema_migrations WHERE version = 5")
+            .fetch_optional(pool)
+            .await?;
+
+    if applied_v5.is_none() {
+        tracing::info!("Applying SQLite migration V5...");
+
+        for stmt in &split_statements(SQLITE_MIGRATION_V5) {
+            sqlx::query(stmt)
+                .execute(pool)
+                .await
+                .map_err(|e| StorageError::Migration(format!("Failed to execute: {}", e)))?;
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query("INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?1)")
+            .bind(&now)
+            .execute(pool)
+            .await?;
+
+        tracing::info!("SQLite migration V5 applied successfully");
+    } else {
+        tracing::debug!("SQLite migration V5 already applied");
     }
 
     Ok(())

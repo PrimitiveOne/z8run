@@ -18,8 +18,9 @@ use axum::{
     http::{HeaderMap, Request, Response, StatusCode},
     middleware::Next,
 };
+use ipnet::IpNet;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -132,62 +133,122 @@ impl RateLimiter {
     }
 }
 
-/// Whether forwarded IP headers (`X-Forwarded-For` / `X-Real-IP`) may be trusted.
+/// Private and loopback ranges trusted by default when `Z8_TRUST_PROXY` is on
+/// and `Z8_TRUSTED_PROXIES` is unset: a reverse proxy on the same host or on a
+/// Docker/VPC network.
+const DEFAULT_TRUSTED_PROXIES: &[&str] = &[
+    "127.0.0.0/8",
+    "::1/128",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "fc00::/7",
+];
+
+/// Which peers may set the client address through forwarded headers (A-08).
 ///
-/// These headers are trivially spoofable by any client that can reach the
-/// backend directly, so honoring them unconditionally lets an attacker rotate
-/// `X-Forwarded-For` to evade per-IP rate limiting. They are only meaningful
-/// when the backend is guaranteed to sit behind a trusted reverse proxy
-/// (e.g. nginx) that overwrites them.
-///
-/// Controlled by `Z8_TRUST_PROXY`: truthy values ("1", "true", "yes",
-/// case-insensitive) enable trust; anything else (including unset) disables it.
-fn trust_proxy_enabled() -> bool {
-    std::env::var("Z8_TRUST_PROXY")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+/// `X-Forwarded-For` is only honored when the TCP peer is a trusted proxy, and
+/// it is read right to left: every hop that is itself a trusted proxy is
+/// skipped and the first untrusted address is the client. Anything a client
+/// prepends to the header sits left of that point and is ignored, so it cannot
+/// be used to rotate identities or to push its quota onto someone else.
+#[derive(Debug, Clone, Default)]
+pub struct ProxyTrust {
+    trusted: Vec<IpNet>,
+}
+
+impl ProxyTrust {
+    /// Reads `Z8_TRUST_PROXY` and `Z8_TRUSTED_PROXIES`.
+    ///
+    /// Trust is off unless `Z8_TRUST_PROXY` is truthy ("1", "true", "yes").
+    /// `Z8_TRUSTED_PROXIES` is a comma-separated list of IPs or CIDRs; when it
+    /// is unset or empty, [`DEFAULT_TRUSTED_PROXIES`] is used.
+    pub fn from_env() -> Self {
+        let enabled = std::env::var("Z8_TRUST_PROXY")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        if !enabled {
+            return Self::default();
+        }
+        let configured = std::env::var("Z8_TRUSTED_PROXIES").unwrap_or_default();
+        let list = if configured.trim().is_empty() {
+            DEFAULT_TRUSTED_PROXIES.join(",")
+        } else {
+            configured
+        };
+        Self::parse(&list)
+    }
+
+    /// Parses a comma-separated list of IPs or CIDRs, skipping invalid entries.
+    pub fn parse(list: &str) -> Self {
+        let trusted = list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter_map(|entry| {
+                entry
+                    .parse::<IpNet>()
+                    .or_else(|_| entry.parse::<IpAddr>().map(IpNet::from))
+                    .map_err(|_| warn!(entry, "Skipping invalid trusted proxy entry"))
+                    .ok()
+            })
+            .collect();
+        Self { trusted }
+    }
+
+    fn is_trusted(&self, ip: IpAddr) -> bool {
+        self.trusted.iter().any(|net| net.contains(&ip))
+    }
 }
 
 /// Extract the client IP used as the rate-limit bucket key.
 ///
-/// When `trust_proxy` is `true`, forwarded headers are preferred (original
-/// client behind a trusted reverse proxy), falling back to the TCP peer address.
-/// When `trust_proxy` is `false`, forwarded headers are ignored entirely and the
-/// actual TCP peer address is always used, so a client cannot spoof its identity.
-///
-/// Falls back to `"unknown"` only when no peer address is available and no
-/// trusted header applies, rather than panicking.
-fn extract_client_ip(headers: &HeaderMap, peer: Option<SocketAddr>, trust_proxy: bool) -> String {
-    if trust_proxy {
-        // Trusted proxy: prefer X-Forwarded-For (first / original client in chain).
-        if let Some(forwarded) = headers.get("x-forwarded-for") {
-            if let Ok(val) = forwarded.to_str() {
-                if let Some(ip) = val.split(',').next() {
-                    let ip = ip.trim();
-                    if !ip.is_empty() {
-                        return ip.to_string();
-                    }
-                }
-            }
-        }
-
-        // Then X-Real-IP.
-        if let Some(real_ip) = headers.get("x-real-ip") {
-            if let Ok(val) = real_ip.to_str() {
-                let val = val.trim();
-                if !val.is_empty() {
-                    return val.to_string();
-                }
-            }
-        }
+/// Forwarded headers are consulted only when the TCP peer is a trusted proxy
+/// (see [`ProxyTrust`]); otherwise the peer address is the client. Falls back
+/// to `"unknown"` when no peer address is available, rather than panicking.
+fn extract_client_ip(headers: &HeaderMap, peer: Option<SocketAddr>, trust: &ProxyTrust) -> String {
+    let Some(peer) = peer else {
+        return "unknown".to_string();
+    };
+    let peer_ip = peer.ip().to_canonical();
+    if !trust.is_trusted(peer_ip) {
+        return peer_ip.to_string();
     }
 
-    // Untrusted (default), or trusted but no usable header: use the TCP peer addr.
-    if let Some(addr) = peer {
-        return addr.ip().to_string();
+    // Multiple X-Forwarded-For headers form one list, in order.
+    let forwarded: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if forwarded.is_empty() {
+        // A trusted proxy that only sets X-Real-IP.
+        return headers
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+            .map(|ip| ip.to_canonical())
+            .unwrap_or(peer_ip)
+            .to_string();
     }
 
-    "unknown".to_string()
+    // Walk from the nearest hop outward. An unparsable entry ends the walk:
+    // nothing left of it was vouched for by a trusted proxy.
+    let mut client = peer_ip;
+    for entry in forwarded.iter().rev() {
+        let Ok(ip) = entry.parse::<IpAddr>() else {
+            break;
+        };
+        client = ip.to_canonical();
+        if !trust.is_trusted(client) {
+            break;
+        }
+    }
+    client.to_string()
 }
 
 /// Build a 429 Too Many Requests response with proper headers.
@@ -250,7 +311,7 @@ async fn rate_limit_inner(req: Request<Body>, next: Next, limiter: &RateLimiter)
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0);
-    let client_ip = extract_client_ip(req.headers(), peer, trust_proxy_enabled());
+    let client_ip = extract_client_ip(req.headers(), peer, proxy_trust());
     let (allowed, remaining, reset_secs) = limiter.check(&client_ip).await;
 
     if !allowed {
@@ -274,6 +335,7 @@ use std::sync::OnceLock;
 static API_LIMITER: OnceLock<RateLimiter> = OnceLock::new();
 static AUTH_LIMITER: OnceLock<RateLimiter> = OnceLock::new();
 static HOOK_LIMITER: OnceLock<RateLimiter> = OnceLock::new();
+static PROXY_TRUST: OnceLock<ProxyTrust> = OnceLock::new();
 
 /// Initialize rate limiters from environment variables.
 /// Call once at startup before building the router.
@@ -301,14 +363,20 @@ pub fn init_rate_limiters() {
     let _ = API_LIMITER.set(RateLimiter::new(api_max, window));
     let _ = AUTH_LIMITER.set(RateLimiter::new(auth_max, window));
     let _ = HOOK_LIMITER.set(RateLimiter::new(hook_max, window));
+    let trust = PROXY_TRUST.get_or_init(ProxyTrust::from_env);
 
     tracing::info!(
         api = api_max,
         auth = auth_max,
         hook = hook_max,
         window_secs = window,
+        trusted_proxies = ?trust.trusted,
         "Rate limiters initialized"
     );
+}
+
+fn proxy_trust() -> &'static ProxyTrust {
+    PROXY_TRUST.get_or_init(ProxyTrust::from_env)
 }
 
 fn api_limiter() -> &'static RateLimiter {
@@ -387,48 +455,110 @@ mod tests {
         }
     }
 
-    #[test]
-    fn untrusted_proxy_ignores_spoofed_forwarded_headers() {
-        // With Z8_TRUST_PROXY off, a client-supplied X-Forwarded-For / X-Real-IP
-        // must be ignored in favor of the real TCP peer address, so it can't be
-        // rotated to evade per-IP rate limiting.
+    fn peer(addr: &str) -> Option<SocketAddr> {
+        Some(addr.parse().unwrap())
+    }
+
+    fn xff(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
+        headers.insert("x-forwarded-for", value.parse().unwrap());
+        headers
+    }
+
+    fn private_ranges() -> ProxyTrust {
+        ProxyTrust::parse(&DEFAULT_TRUSTED_PROXIES.join(","))
+    }
+
+    #[test]
+    fn trust_disabled_ignores_forwarded_headers() {
+        // Default (Z8_TRUST_PROXY off): spoofed headers never change the key.
+        let mut headers = xff("9.9.9.9");
         headers.insert("x-real-ip", "8.8.8.8".parse().unwrap());
-        let peer: SocketAddr = "203.0.113.7:5555".parse().unwrap();
-
-        let ip = extract_client_ip(&headers, Some(peer), false);
+        let ip = extract_client_ip(&headers, peer("203.0.113.7:5555"), &ProxyTrust::default());
         assert_eq!(ip, "203.0.113.7");
     }
 
     #[test]
-    fn trusted_proxy_prefers_forwarded_header() {
-        // With trust enabled, the first hop in X-Forwarded-For wins.
+    fn untrusted_peer_ignores_forwarded_headers() {
+        // Trust is on, but the peer is not a proxy we know: a client hitting
+        // the backend directly cannot choose its own key.
+        let ip = extract_client_ip(&xff("9.9.9.9"), peer("203.0.113.7:5555"), &private_ranges());
+        assert_eq!(ip, "203.0.113.7");
+    }
+
+    #[test]
+    fn appending_proxy_uses_rightmost_untrusted_hop() {
+        // Nginx with $proxy_add_x_forwarded_for appends the real client after
+        // whatever the client sent. The spoofed left entry must be ignored.
+        let headers = xff("6.6.6.6, 198.51.100.4");
+        let ip = extract_client_ip(&headers, peer("172.18.0.3:40000"), &private_ranges());
+        assert_eq!(ip, "198.51.100.4");
+    }
+
+    #[test]
+    fn overwriting_proxy_uses_the_single_entry() {
+        let ip = extract_client_ip(
+            &xff("198.51.100.4"),
+            peer("172.18.0.3:40000"),
+            &private_ranges(),
+        );
+        assert_eq!(ip, "198.51.100.4");
+    }
+
+    #[test]
+    fn chained_trusted_proxies_are_skipped() {
+        // CDN -> nginx -> backend with the CDN range listed as trusted.
+        let trust = ProxyTrust::parse("172.16.0.0/12, 173.245.48.0/20");
+        let headers = xff("6.6.6.6, 198.51.100.4, 173.245.48.10");
+        let ip = extract_client_ip(&headers, peer("172.18.0.3:40000"), &trust);
+        assert_eq!(ip, "198.51.100.4");
+    }
+
+    #[test]
+    fn garbage_entry_stops_the_walk() {
+        let headers = xff("198.51.100.4, not-an-ip, 10.0.0.2");
+        let ip = extract_client_ip(&headers, peer("172.18.0.3:40000"), &private_ranges());
+        assert_eq!(ip, "10.0.0.2");
+    }
+
+    #[test]
+    fn trusted_peer_without_xff_uses_x_real_ip_then_peer() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "9.9.9.9, 10.0.0.1".parse().unwrap());
-        let peer: SocketAddr = "203.0.113.7:5555".parse().unwrap();
-
-        let ip = extract_client_ip(&headers, Some(peer), true);
-        assert_eq!(ip, "9.9.9.9");
+        let trust = private_ranges();
+        assert_eq!(
+            extract_client_ip(&headers, peer("127.0.0.1:1"), &trust),
+            "127.0.0.1"
+        );
+        headers.insert("x-real-ip", "198.51.100.4".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&headers, peer("127.0.0.1:1"), &trust),
+            "198.51.100.4"
+        );
     }
 
     #[test]
-    fn trusted_proxy_falls_back_to_peer_without_headers() {
-        // Trust enabled but no forwarded headers present: use the peer addr.
-        let headers = HeaderMap::new();
-        let peer: SocketAddr = "203.0.113.7:5555".parse().unwrap();
+    fn ipv4_mapped_peer_matches_ipv4_ranges() {
+        // Dual-stack listeners report IPv4 peers as ::ffff:a.b.c.d.
+        let ip = extract_client_ip(
+            &xff("198.51.100.4"),
+            peer("[::ffff:172.18.0.3]:40000"),
+            &private_ranges(),
+        );
+        assert_eq!(ip, "198.51.100.4");
+    }
 
-        let ip = extract_client_ip(&headers, Some(peer), true);
-        assert_eq!(ip, "203.0.113.7");
+    #[test]
+    fn parse_accepts_bare_ips_and_skips_invalid_entries() {
+        let trust = ProxyTrust::parse("10.1.2.3, bogus, 2001:db8::/32");
+        assert_eq!(trust.trusted.len(), 2);
+        assert!(trust.is_trusted("10.1.2.3".parse().unwrap()));
+        assert!(!trust.is_trusted("10.1.2.4".parse().unwrap()));
+        assert!(trust.is_trusted("2001:db8::1".parse().unwrap()));
     }
 
     #[test]
     fn missing_peer_falls_back_to_unknown() {
-        // No peer address and untrusted headers => stable "unknown", no panic.
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
-
-        let ip = extract_client_ip(&headers, None, false);
+        let ip = extract_client_ip(&xff("9.9.9.9"), None, &private_ranges());
         assert_eq!(ip, "unknown");
     }
 

@@ -3,6 +3,10 @@
 //! Main entry point for the z8run flow engine.
 //! Manages the server, migrations, plugins and system information.
 
+mod desktop;
+mod init;
+mod secrets;
+
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -15,12 +19,16 @@ struct Cli {
     #[arg(long, env = "Z8_LOG_LEVEL", default_value = "info")]
     log_level: String,
 
-    /// Data directory
-    #[arg(long, env = "Z8_DATA_DIR", default_value = "./data")]
-    data_dir: String,
+    /// Data directory [default: ./data; without a subcommand, the per-user
+    /// data directory]
+    #[arg(long, env = "Z8_DATA_DIR")]
+    data_dir: Option<String>,
 
+    /// Without a subcommand, z8run runs in desktop mode: it serves on
+    /// 127.0.0.1, keeps data in the per-user data directory and opens the
+    /// editor in the browser.
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -38,6 +46,24 @@ enum Commands {
         /// Database URL (sqlite://./data/z8run.db or postgres://...)
         #[arg(long, env = "Z8_DB_URL")]
         db_url: Option<String>,
+    },
+
+    /// Choose the database and port, and save them for later starts
+    ///
+    /// Writes <data dir>/z8run.env. Without flags it asks interactively.
+    /// Examples:
+    ///   z8run init
+    ///   z8run init --db-url postgres://user:pass@localhost:5432/z8run --port 8080
+    Init {
+        /// Database URL to use instead of asking
+        #[arg(long)]
+        db_url: Option<String>,
+        /// Port to use instead of asking (default 7700)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Replace an existing config without asking
+        #[arg(long)]
+        force: bool,
     },
 
     /// Run database migrations
@@ -93,7 +119,11 @@ async fn main() -> anyhow::Result<()> {
     // Load .env file (silently ignore if not found)
     dotenvy::dotenv().ok();
 
+    // Then the saved `z8run init` answers, without overriding anything set
+    // already. Parse again so arguments backed by env vars see them.
     let cli = Cli::parse();
+    let config_loaded = init::load(std::path::Path::new(&data_dir_for(&cli)))?;
+    let cli = if config_loaded { Cli::parse() } else { cli };
 
     // Configure tracing
     tracing_subscriber::fmt()
@@ -104,25 +134,106 @@ async fn main() -> anyhow::Result<()> {
         .with_thread_ids(false)
         .init();
 
+    // A double-clicked console closes on exit; keep errors readable.
+    let desktop_mode = cli.command.is_none();
+    let result = run(cli).await;
+    if let Err(e) = &result {
+        if desktop_mode {
+            eprintln!("\nError: {e:#}");
+            desktop::wait_before_exit();
+        }
+    }
+    result
+}
+
+/// Data directory for the command: `--data-dir`/`Z8_DATA_DIR` if given, else
+/// the per-user directory for desktop mode and `init`, else `./data`.
+fn data_dir_for(cli: &Cli) -> String {
+    match (&cli.data_dir, &cli.command) {
+        (Some(dir), _) => dir.clone(),
+        (None, None | Some(Commands::Init { .. })) => {
+            desktop::default_data_dir().to_string_lossy().into_owned()
+        }
+        (None, Some(_)) => "./data".to_string(),
+    }
+}
+
+async fn run(cli: Cli) -> anyhow::Result<()> {
+    let data_dir = data_dir_for(&cli);
     match cli.command {
-        Commands::Serve { port, bind, db_url } => {
-            cmd_serve(port, bind, db_url, &cli.data_dir).await?;
+        None => cmd_desktop(data_dir).await?,
+        Some(Commands::Init {
+            db_url,
+            port,
+            force,
+        }) => {
+            init::run(std::path::Path::new(&data_dir), db_url, port, force).await?;
         }
-        Commands::Migrate { db_url } => {
-            cmd_migrate(db_url, &cli.data_dir).await?;
+        Some(Commands::Serve { port, bind, db_url }) => {
+            cmd_serve(port, bind, db_url, &data_dir, false).await?;
         }
-        Commands::Plugin { action } => {
-            cmd_plugin(action, &cli.data_dir).await?;
+        Some(Commands::Migrate { db_url }) => {
+            cmd_migrate(db_url, &data_dir).await?;
         }
-        Commands::Info => {
+        Some(Commands::Plugin { action }) => {
+            cmd_plugin(action, &data_dir).await?;
+        }
+        Some(Commands::Info) => {
             cmd_info();
         }
-        Commands::Validate { file } => {
+        Some(Commands::Validate { file }) => {
             cmd_validate(&file).await?;
         }
     }
 
     Ok(())
+}
+
+/// Desktop mode (no subcommand). Honors the same environment variables as
+/// `serve`, with local-only defaults.
+async fn cmd_desktop(data_dir: String) -> anyhow::Result<()> {
+    let env = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+    let port: u16 = match env("Z8_PORT") {
+        Some(p) => p
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Z8_PORT must be a port number, got '{p}'"))?,
+        None => 7700,
+    };
+    let bind = env("Z8_BIND").unwrap_or_else(|| "127.0.0.1".to_string());
+    let open = desktop::browser_enabled() && z8run_api::ui::is_embedded();
+
+    if desktop::is_running(port).await {
+        let url = format!("http://localhost:{port}");
+        println!("z8run is already running: {url}");
+        if open {
+            desktop::open_browser(&url);
+        }
+        return Ok(());
+    }
+
+    let db_url = env("Z8_DB_URL");
+    if db_url.is_none() {
+        println!(
+            "Using SQLite in {data_dir}. Run `z8run init` to choose another file or PostgreSQL."
+        );
+    }
+    cmd_serve(port, bind, db_url, &data_dir, open).await
+}
+
+/// Default SQLite URL for `data_dir`. sqlx percent-decodes the path, so the
+/// characters that would change its meaning (`%`, `?`, `#`) are encoded; a
+/// Windows user name like `ana#1` must not cut the path short.
+fn sqlite_url(data_dir: &str) -> String {
+    init::sqlite_file_url(&format!("{data_dir}/z8run.db"))
+}
+
+/// Host to show in the editor URL: a wildcard bind is reachable locally.
+fn display_host(bind: &str) -> &str {
+    match bind {
+        "0.0.0.0" | "::" | "[::]" => "localhost",
+        other => other,
+    }
 }
 
 /// The well-known placeholder secret shipped in `.env.example`.
@@ -186,6 +297,7 @@ async fn cmd_serve(
     bind: String,
     db_url: Option<String>,
     data_dir: &str,
+    open_browser: bool,
 ) -> anyhow::Result<()> {
     println!(
         r#"
@@ -209,37 +321,29 @@ async fn cmd_serve(
     tracing::info!(plugins = plugin_count, "Plugins scanned");
 
     // Initialize storage (PostgreSQL or SQLite based on URL)
-    let url = db_url.unwrap_or_else(|| format!("sqlite://{}/z8run.db?mode=rwc", data_dir));
+    let url = db_url.unwrap_or_else(|| sqlite_url(data_dir));
 
-    // JWT secret: required in production, auto-generated for development
-    let jwt_secret = match std::env::var("Z8_JWT_SECRET") {
-        Ok(secret) if !secret.is_empty() => {
-            tracing::info!("JWT secret loaded from Z8_JWT_SECRET");
-            secret
-        }
-        _ => {
-            if url.starts_with("postgres") || url.starts_with("mysql") {
-                anyhow::bail!(
-                    "Z8_JWT_SECRET is required when using PostgreSQL or MySQL. \
-                     Generate one with: openssl rand -base64 32"
-                );
-            }
-            let dev_secret: String = (0..32)
-                .map(|_| format!("{:02x}", rand::random::<u8>()))
-                .collect();
-            tracing::warn!(
-                "No Z8_JWT_SECRET set - generated ephemeral secret (tokens won't survive restarts)"
-            );
-            dev_secret
-        }
-    };
-    // Z8_VAULT_SECRET falls back to the JWT secret when unset. Validate the
-    // effective value that will actually be used for the vault.
-    let vault_secret = std::env::var("Z8_VAULT_SECRET").unwrap_or_else(|_| jwt_secret.clone());
+    // Secrets: from the environment, or generated on first start and kept in
+    // the data directory so sessions and the vault survive restarts.
+    let is_production_db = url.starts_with("postgres") || url.starts_with("mysql");
+    if is_production_db && std::env::var("Z8_JWT_SECRET").map_or(true, |s| s.is_empty()) {
+        // Several instances may share this database; each would generate its
+        // own key, so production secrets must come from the environment.
+        anyhow::bail!(
+            "Z8_JWT_SECRET is required when using PostgreSQL or MySQL. \
+             Generate one with: openssl rand -base64 32"
+        );
+    }
+    let secrets::Secrets {
+        jwt: jwt_secret,
+        jwt_source,
+        vault: vault_secret,
+        vault_source,
+    } = secrets::resolve(std::path::Path::new(data_dir))?;
+    tracing::info!(jwt = ?jwt_source, vault = ?vault_source, "Secrets loaded");
 
     // Reject known-weak/default secrets before startup.
     // Production databases (PostgreSQL/MySQL) hard-fail; SQLite (dev) only warns.
-    let is_production_db = url.starts_with("postgres") || url.starts_with("mysql");
     if is_production_db {
         validate_production_secret("Z8_JWT_SECRET", &jwt_secret)?;
         validate_production_secret("Z8_VAULT_SECRET", &vault_secret)?;
@@ -326,7 +430,15 @@ async fn cmd_serve(
     let addr = format!("{}:{}", bind, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(address = %addr, "Server ready");
-    tracing::info!("Editor: http://{}:{}", bind, port);
+    if z8run_api::ui::is_embedded() {
+        let url = format!("http://{}:{}", display_host(&bind), port);
+        tracing::info!("Editor: {url}");
+        if open_browser {
+            desktop::open_browser(&url);
+        }
+    } else {
+        tracing::info!("API only: this build does not include the web editor (feature embed-ui)");
+    }
 
     // Serve with connection info so per-IP rate limiting can read the real TCP
     // peer address (see z8run_api::rate_limit) instead of trusting spoofable
@@ -343,7 +455,7 @@ async fn cmd_serve(
 /// Run database migrations.
 async fn cmd_migrate(db_url: Option<String>, data_dir: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(data_dir)?;
-    let url = db_url.unwrap_or_else(|| format!("sqlite://{}/z8run.db?mode=rwc", data_dir));
+    let url = db_url.unwrap_or_else(|| sqlite_url(data_dir));
     tracing::info!(url = %mask_db_url(&url), "Running migrations...");
 
     if url.starts_with("postgres") {
@@ -456,6 +568,23 @@ async fn cmd_validate(file: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_url_survives_special_characters_in_the_path() {
+        use std::str::FromStr;
+        for dir in [
+            "/Users/ana/Library/Application Support/z8run",
+            "C:\\Users\\ana#1\\AppData\\Roaming\\z8run",
+            "/home/100%?/z8run",
+        ] {
+            let opts = sqlx::sqlite::SqliteConnectOptions::from_str(&sqlite_url(dir)).unwrap();
+            assert_eq!(
+                opts.get_filename(),
+                std::path::Path::new(&format!("{dir}/z8run.db")),
+                "{dir}"
+            );
+        }
+    }
 
     #[test]
     fn mask_db_url_masks_password() {

@@ -40,7 +40,7 @@ impl NodeExecutor for StructuredOutputNode {
 
         info!(node = %self.name, provider = %self.provider, model = %self.model, "Structured output request");
 
-        let client = reqwest::Client::new();
+        let client = crate::egress::client();
         let timeout = std::time::Duration::from_millis(self.timeout_ms);
 
         // Build system prompt with schema
@@ -53,7 +53,7 @@ impl NodeExecutor for StructuredOutputNode {
         let mut last_error = String::new();
         for attempt in 0..=self.retries {
             let result = call_llm(
-                &client,
+                client,
                 &LlmCallParams {
                     provider: &self.provider,
                     model: &self.model,
@@ -86,7 +86,7 @@ impl NodeExecutor for StructuredOutputNode {
                                     last_error, text
                                 );
                                 let retry_result = call_llm(
-                                    &client,
+                                    client,
                                     &LlmCallParams {
                                         provider: &self.provider,
                                         model: &self.model,

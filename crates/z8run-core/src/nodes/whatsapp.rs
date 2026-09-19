@@ -121,13 +121,10 @@ impl WhatsAppNode {
             return Ok(error_output(&msg, "URL must use HTTPS"));
         }
 
-        let client = reqwest::Client::builder()
-            .https_only(true)
-            .build()
-            .map_err(|e| crate::error::Z8Error::Internal(format!("HTTP client error: {}", e)))?;
+        let client = crate::egress::client();
 
         match client
-            .post(&url)
+            .post(&url)?
             .bearer_auth(&self.access_token)
             .header("Content-Type", "application/json")
             .json(&body)
@@ -137,7 +134,7 @@ impl WhatsAppNode {
         {
             Ok(response) => {
                 let status = response.status().as_u16();
-                let body_text = response.text().await.unwrap_or_default();
+                let body_text = client.read_text(response).await.unwrap_or_default();
 
                 if (200..300).contains(&status) {
                     info!(
@@ -232,13 +229,10 @@ impl WhatsAppNode {
             return Ok(error_output(&msg, "URL must use HTTPS"));
         }
 
-        let client = reqwest::Client::builder()
-            .https_only(true)
-            .build()
-            .map_err(|e| crate::error::Z8Error::Internal(format!("HTTP client error: {}", e)))?;
+        let client = crate::egress::client();
 
         match client
-            .post(&url)
+            .post(&url)?
             .bearer_auth(&self.access_token)
             .header("Content-Type", "application/json")
             .json(&body)
@@ -248,7 +242,7 @@ impl WhatsAppNode {
         {
             Ok(response) => {
                 let status = response.status().as_u16();
-                let body_text = response.text().await.unwrap_or_default();
+                let body_text = client.read_text(response).await.unwrap_or_default();
 
                 if (200..300).contains(&status) {
                     info!(
@@ -340,13 +334,10 @@ impl WhatsAppNode {
             return Ok(error_output(&msg, "URL must use HTTPS"));
         }
 
-        let client = reqwest::Client::builder()
-            .https_only(true)
-            .build()
-            .map_err(|e| crate::error::Z8Error::Internal(format!("HTTP client error: {}", e)))?;
+        let client = crate::egress::client();
 
         match client
-            .post(&url)
+            .post(&url)?
             .bearer_auth(&self.access_token)
             .header("Content-Type", "application/json")
             .json(&body)
@@ -356,7 +347,7 @@ impl WhatsAppNode {
         {
             Ok(response) => {
                 let status = response.status().as_u16();
-                let body_text = response.text().await.unwrap_or_default();
+                let body_text = client.read_text(response).await.unwrap_or_default();
 
                 if (200..300).contains(&status) {
                     info!(

@@ -31,7 +31,7 @@ pub struct LlmCallParams<'a> {
 /// - `"anthropic"`: Anthropic Messages API
 /// - `"ollama"`: Local Ollama instance
 pub async fn call_llm(
-    client: &reqwest::Client,
+    client: &crate::egress::EgressClient,
     params: &LlmCallParams<'_>,
 ) -> Result<String, String> {
     match params.provider {
@@ -41,7 +41,10 @@ pub async fn call_llm(
     }
 }
 
-async fn call_openai(client: &reqwest::Client, p: &LlmCallParams<'_>) -> Result<String, String> {
+async fn call_openai(
+    client: &crate::egress::EgressClient,
+    p: &LlmCallParams<'_>,
+) -> Result<String, String> {
     let url = resolve_api_url(p.base_url, "https://api.openai.com/v1", "/chat/completions");
 
     let body = serde_json::json!({
@@ -55,7 +58,7 @@ async fn call_openai(client: &reqwest::Client, p: &LlmCallParams<'_>) -> Result<
     });
 
     let resp = client
-        .post(&url)
+        .post(&url)?
         .bearer_auth(p.api_key)
         .header("Content-Type", "application/json")
         .timeout(p.timeout)
@@ -71,7 +74,10 @@ async fn call_openai(client: &reqwest::Client, p: &LlmCallParams<'_>) -> Result<
         .to_string())
 }
 
-async fn call_anthropic(client: &reqwest::Client, p: &LlmCallParams<'_>) -> Result<String, String> {
+async fn call_anthropic(
+    client: &crate::egress::EgressClient,
+    p: &LlmCallParams<'_>,
+) -> Result<String, String> {
     let url = resolve_api_url(p.base_url, "https://api.anthropic.com/v1", "/messages");
 
     let body = serde_json::json!({
@@ -82,7 +88,7 @@ async fn call_anthropic(client: &reqwest::Client, p: &LlmCallParams<'_>) -> Resu
     });
 
     let resp = client
-        .post(&url)
+        .post(&url)?
         .header("x-api-key", p.api_key)
         .header("anthropic-version", "2023-06-01")
         .header("Content-Type", "application/json")
@@ -99,7 +105,10 @@ async fn call_anthropic(client: &reqwest::Client, p: &LlmCallParams<'_>) -> Resu
         .to_string())
 }
 
-async fn call_ollama(client: &reqwest::Client, p: &LlmCallParams<'_>) -> Result<String, String> {
+async fn call_ollama(
+    client: &crate::egress::EgressClient,
+    p: &LlmCallParams<'_>,
+) -> Result<String, String> {
     let url = resolve_api_url(p.base_url, "http://localhost:11434", "/api/chat");
 
     let body = serde_json::json!({
@@ -113,7 +122,7 @@ async fn call_ollama(client: &reqwest::Client, p: &LlmCallParams<'_>) -> Result<
     });
 
     let resp = client
-        .post(&url)
+        .post(&url)?
         .timeout(p.timeout)
         .json(&body)
         .send()

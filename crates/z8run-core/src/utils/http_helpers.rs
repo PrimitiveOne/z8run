@@ -37,8 +37,8 @@ pub fn resolve_api_url(base_url: &str, default_base: &str, endpoint: &str) -> St
 /// ```
 pub async fn check_response(resp: reqwest::Response, context: &str) -> Result<String, String> {
     let status = resp.status().as_u16();
-    let text = resp
-        .text()
+    let text = crate::egress::client()
+        .read_text(resp)
         .await
         .map_err(|e| format!("{} read error: {}", context, e))?;
     if status != 200 {

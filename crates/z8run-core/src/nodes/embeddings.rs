@@ -34,12 +34,12 @@ impl NodeExecutor for EmbeddingsNode {
 
         info!(node = %self.name, provider = %self.provider, chars = text.len(), "Embedding request");
 
-        let client = reqwest::Client::new();
+        let client = crate::egress::client();
         let timeout = std::time::Duration::from_millis(self.timeout_ms);
 
         let result = match self.provider.as_str() {
-            "ollama" => self.call_ollama(&client, &text, timeout).await,
-            _ => self.call_openai(&client, &text, timeout).await,
+            "ollama" => self.call_ollama(client, &text, timeout).await,
+            _ => self.call_openai(client, &text, timeout).await,
         };
 
         match result {
@@ -93,7 +93,7 @@ impl NodeExecutor for EmbeddingsNode {
 impl EmbeddingsNode {
     async fn call_openai(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         text: &str,
         timeout: std::time::Duration,
     ) -> Result<Vec<f64>, String> {
@@ -110,7 +110,7 @@ impl EmbeddingsNode {
         });
 
         let resp = client
-            .post(&url)
+            .post(&url)?
             .bearer_auth(&self.api_key)
             .header("Content-Type", "application/json")
             .timeout(timeout)
@@ -120,8 +120,8 @@ impl EmbeddingsNode {
             .map_err(|e| format!("Request failed: {}", e))?;
 
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
+        let text = client
+            .read_text(resp)
             .await
             .map_err(|e| format!("Read error: {}", e))?;
         if status != 200 {
@@ -141,7 +141,7 @@ impl EmbeddingsNode {
 
     async fn call_ollama(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         text: &str,
         timeout: std::time::Duration,
     ) -> Result<Vec<f64>, String> {
@@ -158,7 +158,7 @@ impl EmbeddingsNode {
         });
 
         let resp = client
-            .post(&url)
+            .post(&url)?
             .header("Content-Type", "application/json")
             .timeout(timeout)
             .json(&body)
@@ -167,8 +167,8 @@ impl EmbeddingsNode {
             .map_err(|e| format!("Request failed: {}", e))?;
 
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
+        let text = client
+            .read_text(resp)
             .await
             .map_err(|e| format!("Read error: {}", e))?;
         if status != 200 {

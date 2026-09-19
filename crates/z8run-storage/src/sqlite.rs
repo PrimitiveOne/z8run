@@ -6,7 +6,8 @@ use uuid::Uuid;
 use z8run_core::flow::Flow;
 
 use crate::repository::{
-    ExecutionRecord, ExecutionRepository, FlowRepository, HookRoute, UserRecord, UserRepository,
+    ExecutionRecord, ExecutionRepository, FlowRepository, HookMatch, HookRoute, UserRecord,
+    UserRepository,
 };
 use crate::StorageError;
 
@@ -126,7 +127,7 @@ impl FlowRepository for SqliteStorage {
             return Err(StorageError::FlowNotFound(id));
         }
 
-        self.delete_hook_routes(id).await?;
+        self.undeploy_flow(id).await?;
 
         tracing::debug!(flow_id = %id, "Flow deleted");
         Ok(())
@@ -239,7 +240,7 @@ impl FlowRepository for SqliteStorage {
             return Err(StorageError::FlowNotFound(id));
         }
 
-        self.delete_hook_routes(id).await?;
+        self.undeploy_flow(id).await?;
 
         Ok(())
     }
@@ -261,16 +262,21 @@ impl FlowRepository for SqliteStorage {
         }
     }
 
-    async fn replace_hook_routes(
+    async fn deploy_flow(
         &self,
         flow_id: Uuid,
         user_id: Uuid,
+        snapshot: &Flow,
         routes: &[HookRoute],
     ) -> Result<(), StorageError> {
         let flow_id_str = flow_id.to_string();
         let user_id_str = user_id.to_string();
         let now = chrono::Utc::now().to_rfc3339();
+        let snapshot_json = serde_json::to_string(snapshot)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
+        // Snapshot and routes change together or not at all, so a hook can
+        // never match a route whose snapshot is missing or stale.
         let mut tx = self.pool.begin().await?;
 
         sqlx::query("DELETE FROM hook_routes WHERE flow_id = ?1")
@@ -278,15 +284,31 @@ impl FlowRepository for SqliteStorage {
             .execute(&mut *tx)
             .await?;
 
+        sqlx::query(
+            r#"INSERT INTO flow_deployments (flow_id, user_id, snapshot, deployed_at)
+               VALUES (?1, ?2, ?3, ?4)
+               ON CONFLICT(flow_id) DO UPDATE SET
+                   user_id = excluded.user_id,
+                   snapshot = excluded.snapshot,
+                   deployed_at = excluded.deployed_at"#,
+        )
+        .bind(&flow_id_str)
+        .bind(&user_id_str)
+        .bind(&snapshot_json)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
         for route in routes {
             sqlx::query(
-                r#"INSERT INTO hook_routes (flow_id, user_id, method, path, node_type, created_at)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+                r#"INSERT INTO hook_routes (flow_id, user_id, method, path, node_id, node_type, created_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
             )
             .bind(&flow_id_str)
             .bind(&user_id_str)
             .bind(&route.method)
             .bind(&route.path)
+            .bind(&route.node_id)
             .bind(&route.node_type)
             .bind(&now)
             .execute(&mut *tx)
@@ -302,31 +324,51 @@ impl FlowRepository for SqliteStorage {
         flow_id: Uuid,
         method: &str,
         path: &str,
-    ) -> Result<Option<Uuid>, StorageError> {
-        let flow_id_str = flow_id.to_string();
-
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT user_id FROM hook_routes WHERE flow_id = ?1 AND method = ?2 AND path = ?3",
+    ) -> Result<Option<HookMatch>, StorageError> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT user_id, node_id FROM hook_routes WHERE flow_id = ?1 AND method = ?2 AND path = ?3",
         )
-        .bind(&flow_id_str)
+        .bind(flow_id.to_string())
         .bind(method)
         .bind(path)
         .fetch_optional(&self.pool)
         .await?;
 
         match row {
-            Some((uid,)) => Ok(Some(
-                Uuid::parse_str(&uid).map_err(|e| StorageError::Serialization(e.to_string()))?,
-            )),
+            Some((uid, node_id)) => Ok(Some(HookMatch {
+                user_id: Uuid::parse_str(&uid)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?,
+                node_id,
+            })),
             None => Ok(None),
         }
     }
 
-    async fn delete_hook_routes(&self, flow_id: Uuid) -> Result<(), StorageError> {
+    async fn get_deployment(&self, flow_id: Uuid) -> Result<Option<Flow>, StorageError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT snapshot FROM flow_deployments WHERE flow_id = ?1")
+                .bind(flow_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+
+        row.map(|(json,)| {
+            serde_json::from_str(&json).map_err(|e| StorageError::Serialization(e.to_string()))
+        })
+        .transpose()
+    }
+
+    async fn undeploy_flow(&self, flow_id: Uuid) -> Result<(), StorageError> {
+        let flow_id_str = flow_id.to_string();
+        let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM hook_routes WHERE flow_id = ?1")
-            .bind(flow_id.to_string())
-            .execute(&self.pool)
+            .bind(&flow_id_str)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM flow_deployments WHERE flow_id = ?1")
+            .bind(&flow_id_str)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -564,36 +606,50 @@ mod tests {
         SqliteStorage::from_pool(pool)
     }
 
-    fn route(method: &str, path: &str) -> HookRoute {
+    fn route(method: &str, path: &str, node_id: &str) -> HookRoute {
         HookRoute {
             method: method.to_string(),
             path: path.to_string(),
+            node_id: node_id.to_string(),
             node_type: "http-in".to_string(),
         }
     }
 
+    fn matched(owner: Uuid, node_id: &str) -> Option<HookMatch> {
+        Some(HookMatch {
+            user_id: owner,
+            node_id: node_id.to_string(),
+        })
+    }
+
     #[tokio::test]
-    async fn test_hook_route_matches_method_and_path() {
+    async fn test_hook_route_matches_method_and_path_and_binds_node() {
         let storage = memory_storage().await;
         let flow = Uuid::now_v7();
         let owner = Uuid::now_v7();
+        let snapshot = Flow::new("deployed");
 
         storage
-            .replace_hook_routes(flow, owner, &[route("POST", "/branch"), route("GET", "/")])
+            .deploy_flow(
+                flow,
+                owner,
+                &snapshot,
+                &[route("POST", "/branch", "n1"), route("GET", "/", "n2")],
+            )
             .await
             .unwrap();
 
-        // Exact matches resolve to the owner.
+        // Exact matches resolve to the owner AND the trigger that declared them.
         assert_eq!(
             storage
                 .find_hook_route(flow, "POST", "/branch")
                 .await
                 .unwrap(),
-            Some(owner)
+            matched(owner, "n1")
         );
         assert_eq!(
             storage.find_hook_route(flow, "GET", "/").await.unwrap(),
-            Some(owner)
+            matched(owner, "n2")
         );
 
         // Wrong method, wrong path, and unknown flow are all rejected.
@@ -621,18 +677,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_replace_hook_routes_is_idempotent_replacement() {
+    async fn test_redeploy_replaces_routes_and_snapshot() {
         let storage = memory_storage().await;
         let flow = Uuid::now_v7();
         let owner = Uuid::now_v7();
 
         storage
-            .replace_hook_routes(flow, owner, &[route("POST", "/branch")])
+            .deploy_flow(
+                flow,
+                owner,
+                &Flow::new("v1"),
+                &[route("POST", "/branch", "n1")],
+            )
             .await
             .unwrap();
-        // Re-deploy with a different route set: the old route must disappear.
+        // Re-deploy with a different route set: the old route must disappear
+        // and the snapshot must be the new version.
         storage
-            .replace_hook_routes(flow, owner, &[route("POST", "/")])
+            .deploy_flow(flow, owner, &Flow::new("v2"), &[route("POST", "/", "n9")])
             .await
             .unwrap();
 
@@ -645,14 +707,69 @@ mod tests {
         );
         assert_eq!(
             storage.find_hook_route(flow, "POST", "/").await.unwrap(),
-            Some(owner)
+            matched(owner, "n9")
         );
+        assert_eq!(
+            storage.get_deployment(flow).await.unwrap().map(|f| f.name),
+            Some("v2".to_string())
+        );
+    }
 
-        // Deleting the flow's routes clears the remaining match.
-        storage.delete_hook_routes(flow).await.unwrap();
+    #[tokio::test]
+    async fn test_undeploy_removes_routes_and_snapshot() {
+        let storage = memory_storage().await;
+        let flow = Uuid::now_v7();
+        let owner = Uuid::now_v7();
+
+        storage
+            .deploy_flow(flow, owner, &Flow::new("v1"), &[route("POST", "/", "n1")])
+            .await
+            .unwrap();
+        storage.undeploy_flow(flow).await.unwrap();
+
         assert_eq!(
             storage.find_hook_route(flow, "POST", "/").await.unwrap(),
             None
+        );
+        assert!(storage.get_deployment(flow).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_deployment_snapshot_is_independent_of_later_edits() {
+        let storage = memory_storage().await;
+        let owner = Uuid::now_v7();
+        // flows.user_id references users(id), so the owner must exist.
+        storage
+            .create_user(&UserRecord {
+                id: owner,
+                email: "owner@example.com".to_string(),
+                username: "owner".to_string(),
+                password_hash: "x".to_string(),
+                roles: vec!["user".to_string()],
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let mut flow = Flow::new("original");
+        storage.save_flow_with_user(&flow, owner).await.unwrap();
+
+        storage
+            .deploy_flow(flow.id, owner, &flow, &[route("POST", "/", "n1")])
+            .await
+            .unwrap();
+
+        // Editing the live flow after deploy must not alter the snapshot (A-05).
+        flow.name = "edited".to_string();
+        storage.save_flow(&flow).await.unwrap();
+
+        assert_eq!(
+            storage
+                .get_deployment(flow.id)
+                .await
+                .unwrap()
+                .map(|f| f.name),
+            Some("original".to_string())
         );
     }
 }

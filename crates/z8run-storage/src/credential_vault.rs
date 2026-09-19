@@ -4,10 +4,9 @@
 //! WASM nodes only receive temporary tokens, never the actual key.
 
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, AeadCore, KeyInit, OsRng},
     Aes256Gcm, Nonce,
 };
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -69,16 +68,15 @@ impl VaultCrypto {
 
     /// Encrypts plaintext. Returns (ciphertext, nonce).
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), StorageError> {
-        let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        // A fresh random 96-bit nonce from the OS for every encryption.
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
         let ciphertext = self
             .cipher
-            .encrypt(nonce, plaintext)
+            .encrypt(&nonce, plaintext)
             .map_err(|e| StorageError::Encryption(format!("Encryption failed: {}", e)))?;
 
-        Ok((ciphertext, nonce_bytes.to_vec()))
+        Ok((ciphertext, nonce.to_vec()))
     }
 
     /// Decrypts ciphertext using the provided nonce.

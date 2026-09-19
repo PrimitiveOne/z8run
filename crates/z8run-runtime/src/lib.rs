@@ -36,6 +36,9 @@ pub enum RuntimeError {
     #[error("WASM execution error: {0}")]
     Execution(String),
 
+    #[error("Plugin limit exceeded: {0}")]
+    LimitExceeded(String),
+
     #[error("Module exceeded memory limit: {used_mb}MB (maximum: {limit_mb}MB)")]
     MemoryLimitExceeded { used_mb: u64, limit_mb: u64 },
 

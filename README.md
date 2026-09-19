@@ -59,6 +59,55 @@ z8run is an open-source visual flow engine built from the ground up in **Rust** 
 
 ## Quick Start
 
+### Standalone binary (Windows, macOS, Linux)
+
+One file with the editor built in: no Docker, Node.js or database server
+needed. Download it from [Releases](https://github.com/z8run/z8run/releases):
+
+| Platform | File |
+|---|---|
+| Windows x86_64 | `z8run-windows-x86_64.zip` (contains `z8run.exe`) |
+| macOS Apple Silicon | `z8run-macos-arm64` |
+| Linux x86_64 | `z8run-linux-x86_64` |
+
+Each file has a `.sha256` next to it to verify the download.
+
+Start it by double-clicking it, or from a terminal:
+
+```bash
+./z8run                       # Windows: z8run.exe
+```
+
+It opens the editor at `http://localhost:7700` in your browser; create an
+account with **Create one** on the sign-in page. Started this way, z8run:
+
+- listens on `127.0.0.1` only, so other machines on your network can't reach it;
+- stores everything (SQLite database, keys, plugins) in your user folder:
+  `%APPDATA%\z8run` on Windows, `~/Library/Application Support/z8run` on
+  macOS, `~/.local/share/z8run` on Linux;
+- if it is already running, just opens the browser again.
+
+To use PostgreSQL, another SQLite file or another port, run the setup once:
+
+```bash
+z8run init
+```
+
+It asks, checks that the database works, and saves the answers for later
+starts (`--db-url`, `--port` and `--force` skip the questions).
+
+> **The binaries are not code-signed yet**, so the first start shows a warning:
+> - **Windows:** SmartScreen says "Windows protected your PC". Click
+>   **More info → Run anyway**.
+> - **macOS:** right-click the file → **Open**, then **Open** again. Or, from a
+>   terminal: `xattr -d com.apple.quarantine z8run-macos-arm64 && chmod +x z8run-macos-arm64`.
+> - **Linux:** `chmod +x z8run-linux-x86_64`.
+>
+> Compare the `.sha256` before bypassing the warning.
+
+Back up the data folder, in particular `secrets/vault.key`: without it, the
+credentials stored in the vault can't be decrypted.
+
 ### From Source
 
 **Requirements:** [Rust](https://rustup.rs/) 1.91+, Node.js 22+ and `npm` (for frontend)
@@ -66,10 +115,14 @@ z8run is an open-source visual flow engine built from the ground up in **Rust** 
 ```bash
 git clone https://github.com/z8run/z8run.git
 cd z8run
-cp .env.example .env          # adjust as needed
-cargo build --release
-cargo run --bin z8run -- serve
+npm --prefix frontend ci && npm --prefix frontend run build
+cargo build --release --features embed-ui
+./target/release/z8run        # desktop mode, as above
 ```
+
+Without `--features embed-ui` the binary serves only the API, and the editor
+runs from the Vite dev server (`npm --prefix frontend run dev`, port 5173),
+which proxies to the API on port 7700.
 
 ### With Docker
 
@@ -126,8 +179,7 @@ z8run/
 │   ├── z8run-runtime    # WASM plugin sandbox (wasmtime)
 │   └── z8run-api        # REST + WebSocket server (Axum)
 ├── bins/
-│   ├── z8run-cli        # Main CLI binary
-│   └── z8run-server     # Server with embedded frontend
+│   └── z8run-cli        # z8run binary (serves the editor with --features embed-ui)
 ├── frontend/            # React + TypeScript visual editor
 │   ├── src/features/    # Editor canvas, node palette, config panel
 │   ├── src/stores/      # Zustand state management
@@ -146,7 +198,9 @@ z8run/
 ## CLI
 
 ```bash
-z8run serve                            # Start the server (default port 7700)
+z8run                                  # Desktop mode: 127.0.0.1, per-user data folder, opens the browser
+z8run init                             # Choose the database (SQLite/PostgreSQL) and port
+z8run serve                            # Server mode: 0.0.0.0, ./data (Docker, services)
 z8run serve -p 8080                    # Custom port
 z8run migrate                          # Run database migrations
 z8run plugin list                      # List installed plugins
@@ -163,13 +217,19 @@ z8run info                             # Show system information
 | Variable | Default | Description |
 |---|---|---|
 | `Z8_PORT` | `7700` | HTTP/WebSocket port |
-| `Z8_BIND` | `0.0.0.0` | Bind address |
-| `Z8_DATA_DIR` | `./data` | Data directory (database, plugins) |
+| `Z8_BIND` | `0.0.0.0` (`127.0.0.1` in desktop mode) | Bind address |
+| `Z8_DATA_DIR` | `./data` (per-user folder in desktop mode and `init`) | Data directory (database, keys, plugins, `z8run.env` from `init`) |
 | `Z8_DB_URL` | SQLite auto | Database URL (`sqlite://` or `postgres://`) |
 | `Z8_LOG_LEVEL` | `info` | Log level (trace, debug, info, warn, error) |
-| `Z8_JWT_SECRET` | - | JWT signing secret (**required** for PostgreSQL/MySQL, auto-generated for SQLite dev). Generate with `openssl rand -base64 32` |
-| `Z8_VAULT_SECRET` | - | Encryption key for the credential vault (**must** change in production) |
+| `Z8_JWT_SECRET` | - | JWT signing secret. **Required** for PostgreSQL/MySQL; with SQLite, generated once and kept in `<data dir>/secrets/jwt.key`. Generate with `openssl rand -base64 32` |
+| `Z8_VAULT_SECRET` | - | Encryption key for the credential vault. Falls back to `Z8_JWT_SECRET` when that is set, else generated once in `<data dir>/secrets/vault.key` |
+| `Z8_NO_BROWSER` | - | Set to `1` so desktop mode doesn't open the browser |
 | `POSTGRES_PASSWORD` | - | Password for the PostgreSQL user (Docker deployment) |
+
+Precedence: real environment variables, then `.env` in the working directory,
+then `<data dir>/z8run.env` written by `z8run init`. See
+[`.env.example`](.env.example) for the rest: rate limits and proxy trust,
+outbound (egress) policy for flows, database node limits and webhook limits.
 
 ## API
 
@@ -232,6 +292,7 @@ z8run ships with 39 built-in nodes (the authoritative list is the `register_node
 - [x] CI/CD pipeline (GitHub Actions: build, test, deploy, release)
 - [x] Domain setup with Cloudflare (landing + app subdomains)
 - [x] Plugin install/remove CLI (`z8run plugin install`, `z8run plugin remove`)
+- [x] Standalone binary with embedded editor, including Windows (`--features embed-ui`, desktop mode, `z8run init`)
 - [ ] Undo/redo in the flow editor
 - [ ] Flow duplication
 - [ ] Node search/filter in the palette

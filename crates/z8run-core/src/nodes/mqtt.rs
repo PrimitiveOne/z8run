@@ -111,7 +111,11 @@ impl MqttNode {
         }
 
         // Build MQTT options
-        let mut opts = MqttOptions::new(&self.client_id, &self.broker, self.port);
+        let host = match self.broker_host().await {
+            Ok(host) => host,
+            Err(e) => return Ok(error_output(&msg, &e.to_string())),
+        };
+        let mut opts = MqttOptions::new(&self.client_id, host, self.port);
         opts.set_keep_alive(Duration::from_secs(self.keep_alive));
 
         if !self.username.is_empty() {
@@ -169,6 +173,21 @@ impl MqttNode {
         }
     }
 
+    /// Checks the broker against the egress policy and returns the host to
+    /// connect to. Without TLS the checked IP is used directly, so a DNS
+    /// answer that changes between the check and the connection has no
+    /// effect; with TLS the name is kept for certificate verification.
+    async fn broker_host(&self) -> Result<String, crate::egress::EgressError> {
+        let addrs = crate::egress::client()
+            .policy()
+            .resolve(&self.broker, self.port)
+            .await?;
+        Ok(match addrs.first() {
+            Some(addr) if !self.use_tls => addr.ip().to_string(),
+            _ => self.broker.clone(),
+        })
+    }
+
     /// Subscribe mode: connect, subscribe to topic, wait for one message
     async fn handle_subscribe(&self, msg: FlowMessage) -> Z8Result<Vec<FlowMessage>> {
         info!(
@@ -179,7 +198,11 @@ impl MqttNode {
         );
 
         // Build MQTT options
-        let mut opts = MqttOptions::new(&self.client_id, &self.broker, self.port);
+        let host = match self.broker_host().await {
+            Ok(host) => host,
+            Err(e) => return Ok(error_output(&msg, &e.to_string())),
+        };
+        let mut opts = MqttOptions::new(&self.client_id, host, self.port);
         opts.set_keep_alive(Duration::from_secs(self.keep_alive));
 
         if !self.username.is_empty() {

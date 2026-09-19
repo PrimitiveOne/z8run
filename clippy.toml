@@ -1,0 +1,10 @@
+# Outbound HTTP from flow nodes must go through z8run_core::egress so the
+# destination policy, redirect checks and response limits apply (A-03).
+disallowed-methods = [
+    { path = "reqwest::Client::new", reason = "use z8run_core::egress::client()" },
+    { path = "reqwest::Client::builder", reason = "use z8run_core::egress::client()" },
+    { path = "reqwest::get", reason = "use z8run_core::egress::client()" },
+    { path = "reqwest::Response::text", reason = "use EgressClient::read_text (size-capped)" },
+    { path = "reqwest::Response::json", reason = "use EgressClient::read_json (size-capped)" },
+    { path = "reqwest::Response::bytes", reason = "use EgressClient::read_bytes (size-capped)" },
+]

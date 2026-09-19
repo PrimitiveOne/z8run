@@ -64,7 +64,7 @@ enum AgentStep {
 #[async_trait::async_trait]
 impl NodeExecutor for AiAgentNode {
     async fn process(&self, msg: FlowMessage) -> Z8Result<Vec<FlowMessage>> {
-        let client = reqwest::Client::new();
+        let client = crate::egress::client();
         let timeout = std::time::Duration::from_millis(self.timeout_ms);
 
         // Check if this is a continuation (tool_result coming back)
@@ -166,9 +166,9 @@ impl NodeExecutor for AiAgentNode {
 
         // Call LLM
         let result = match self.provider.as_str() {
-            "anthropic" => self.call_anthropic_agent(&client, &history, timeout).await,
-            "ollama" => self.call_ollama_agent(&client, &history, timeout).await,
-            _ => self.call_openai_agent(&client, &history, timeout).await,
+            "anthropic" => self.call_anthropic_agent(client, &history, timeout).await,
+            "ollama" => self.call_ollama_agent(client, &history, timeout).await,
+            _ => self.call_openai_agent(client, &history, timeout).await,
         };
 
         match result {
@@ -289,7 +289,7 @@ impl AiAgentNode {
     /// Call OpenAI API and return the agent step + raw assistant message for history.
     async fn call_openai_agent(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         messages: &[serde_json::Value],
         timeout: std::time::Duration,
     ) -> Result<(AgentStep, serde_json::Value), String> {
@@ -326,7 +326,7 @@ impl AiAgentNode {
         }
 
         let resp = client
-            .post(&url)
+            .post(&url)?
             .bearer_auth(&self.api_key)
             .header("Content-Type", "application/json")
             .timeout(timeout)
@@ -336,8 +336,8 @@ impl AiAgentNode {
             .map_err(|e| format!("OpenAI request failed: {}", e))?;
 
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
+        let text = client
+            .read_text(resp)
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
 
@@ -380,7 +380,7 @@ impl AiAgentNode {
     /// Call Anthropic API.
     async fn call_anthropic_agent(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         messages: &[serde_json::Value],
         timeout: std::time::Duration,
     ) -> Result<(AgentStep, serde_json::Value), String> {
@@ -427,7 +427,7 @@ impl AiAgentNode {
         }
 
         let resp = client
-            .post(&url)
+            .post(&url)?
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
@@ -438,8 +438,8 @@ impl AiAgentNode {
             .map_err(|e| format!("Anthropic request failed: {}", e))?;
 
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
+        let text = client
+            .read_text(resp)
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
 
@@ -486,7 +486,7 @@ impl AiAgentNode {
     /// Call Ollama API (no tool support yet, but returns same format).
     async fn call_ollama_agent(
         &self,
-        client: &reqwest::Client,
+        client: &crate::egress::EgressClient,
         messages: &[serde_json::Value],
         timeout: std::time::Duration,
     ) -> Result<(AgentStep, serde_json::Value), String> {
@@ -527,7 +527,7 @@ impl AiAgentNode {
         }
 
         let resp = client
-            .post(&url)
+            .post(&url)?
             .header("Content-Type", "application/json")
             .timeout(timeout)
             .json(&body)
@@ -536,8 +536,8 @@ impl AiAgentNode {
             .map_err(|e| format!("Ollama request failed: {}", e))?;
 
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
+        let text = client
+            .read_text(resp)
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
 

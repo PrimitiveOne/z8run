@@ -52,8 +52,7 @@ z8run/
 │   ├── z8run-runtime    # WASM plugin sandbox (wasmtime)
 │   └── z8run-api        # REST + WebSocket server (Axum)
 ├── bins/
-│   ├── z8run-cli        # CLI binary
-│   └── z8run-server     # Server with embedded frontend
+│   └── z8run-cli        # CLI binary (serves the editor with --features embed-ui)
 ├── frontend/            # React + TypeScript visual editor
 └── Cargo.toml           # Workspace root
 ```

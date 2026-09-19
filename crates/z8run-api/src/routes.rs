@@ -338,12 +338,22 @@ async fn get_flow(
         .cloned()
         .unwrap_or(serde_json::json!({"x": 0, "y": 0, "zoom": 1}));
 
+    // Whether this flow's public hooks are live, so the UI can offer to stop
+    // them (a deployed hook flow is idle between requests, not "running").
+    let deployed = state
+        .storage
+        .get_deployment(id)
+        .await
+        .map_err(ApiError::from)?
+        .is_some();
+
     Ok(Json(serde_json::json!({
         "id": flow.id.to_string(),
         "name": flow.name,
         "description": flow.description,
         "version": flow.version,
         "status": flow.status.to_string(),
+        "deployed": deployed,
         "nodes": flow.nodes,
         "edges": flow.edges,
         "canvas_nodes": canvas_nodes,
@@ -396,7 +406,7 @@ async fn start_flow(
     );
 
     // Determine the HTTP entry points this flow exposes.
-    let hook_routes = collect_hook_routes(&stored_flow);
+    let hook_routes = collect_hook_routes(&stored_flow)?;
     let has_input_nodes = !hook_routes.is_empty();
 
     // Return canvas_id → core UUID mapping so the frontend can
@@ -408,11 +418,12 @@ async fn start_flow(
 
     if has_input_nodes {
         // Flow has input nodes (http-in, webhook, etc.) - don't execute now.
-        // Persist the exact routes so the public hook handler can authorize
-        // incoming requests by flow + method + path, then wait for triggers.
+        // Persist an immutable snapshot plus the exact routes bound to their
+        // trigger nodes. Hooks run this snapshot, so later canvas edits don't
+        // change what a published URL executes until the next deploy (A-05).
         state
             .storage
-            .replace_hook_routes(id, claims.sub, &hook_routes)
+            .deploy_flow(id, claims.sub, &stored_flow, &hook_routes)
             .await
             .map_err(ApiError::from)?;
 
@@ -425,7 +436,15 @@ async fn start_flow(
             "routes": registered_routes,
         })))
     } else {
-        // No input nodes - execute immediately (manual/cron flow).
+        // No input nodes - execute immediately (manual/cron flow). If an
+        // earlier version of this flow was deployed with hooks, retire them:
+        // otherwise its old URLs would stay live after the triggers were removed.
+        state
+            .storage
+            .undeploy_flow(id)
+            .await
+            .map_err(ApiError::from)?;
+
         let trace_id = state
             .engine
             .execute(exec_flow)
@@ -458,8 +477,13 @@ fn normalize_hook_path(path: &str) -> String {
 
 /// Scans canvas_nodes for HTTP-trigger nodes and returns their exact routes.
 /// Each flow gets its own namespace: /hook/{flow_id}/{path}.
-fn collect_hook_routes(stored: &Flow) -> Vec<HookRoute> {
-    let mut routes = Vec::new();
+///
+/// Each route is bound to the canvas id of the trigger that declared it, so a
+/// request is later authorized and executed against that node only (A-01).
+/// Two triggers declaring the same method + path would make the route
+/// ambiguous, so the deploy is rejected instead of picking one silently.
+fn collect_hook_routes(stored: &Flow) -> Result<Vec<HookRoute>, ApiError> {
+    let mut routes: Vec<HookRoute> = Vec::new();
 
     let canvas_nodes = match stored
         .metadata
@@ -468,27 +492,43 @@ fn collect_hook_routes(stored: &Flow) -> Vec<HookRoute> {
         .and_then(|v| v.as_array())
     {
         Some(nodes) => nodes,
-        None => return routes,
+        None => return Ok(routes),
     };
 
     for node in canvas_nodes {
         let data = &node["data"];
         let node_type = data["type"].as_str().unwrap_or("");
-
-        if HOOK_NODE_TYPES.contains(&node_type) {
-            let config = &data["config"];
-            let method = config["method"].as_str().unwrap_or("POST").to_uppercase();
-            let path = normalize_hook_path(config["path"].as_str().unwrap_or("/"));
-
-            routes.push(HookRoute {
-                method,
-                path,
-                node_type: node_type.to_string(),
-            });
+        if !HOOK_NODE_TYPES.contains(&node_type) {
+            continue;
         }
+
+        // A trigger without an id cannot be bound to its route; skipping it
+        // leaves no route, which fails closed.
+        let Some(node_id) = node["id"].as_str().filter(|s| !s.is_empty()) else {
+            warn!(node_type, "Skipping hook trigger without a canvas id");
+            continue;
+        };
+
+        let config = &data["config"];
+        let method = config["method"].as_str().unwrap_or("POST").to_uppercase();
+        let path = normalize_hook_path(config["path"].as_str().unwrap_or("/"));
+
+        if let Some(existing) = routes.iter().find(|r| r.method == method && r.path == path) {
+            return Err(ApiError::bad_request(format!(
+                "Duplicate hook route {method} {path}: declared by nodes '{}' and '{node_id}'",
+                existing.node_id
+            )));
+        }
+
+        routes.push(HookRoute {
+            method,
+            path,
+            node_id: node_id.to_string(),
+            node_type: node_type.to_string(),
+        });
     }
 
-    routes
+    Ok(routes)
 }
 
 /// Builds the user-facing hook URLs (`/hook/{flow_id}{path}`) for display.
@@ -761,14 +801,194 @@ async fn get_executions(
 /// POST /api/v1/flows/:id/stop
 async fn stop_flow(
     State(state): State<Arc<AppState>>,
-    axum::Extension(_claims): axum::Extension<Claims>,
+    axum::Extension(claims): axum::Extension<Claims>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Only the owner may stop a flow (A-02): another user's id 404s exactly
+    // like a missing flow, so ownership can't be probed.
+    state
+        .storage
+        .get_flow_for_user(id, claims.sub)
+        .await
+        .map_err(ApiError::from)?;
+
     state.engine.stop(id).await.map_err(ApiError::from)?;
+
+    // Stopping also retires the flow's public hooks; before this, a "stopped"
+    // flow kept accepting webhook requests.
+    state
+        .storage
+        .undeploy_flow(id)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(serde_json::json!({
         "flow_id": id.to_string(),
         "status": "stopped",
     })))
+}
+
+/// Returns the `data.config` of canvas node `node_id` in `flow`, if present.
+fn trigger_node_config(flow: &Flow, node_id: &str) -> Option<serde_json::Value> {
+    flow.metadata
+        .positions
+        .get("canvas_nodes")?
+        .as_array()?
+        .iter()
+        .find(|n| n["id"].as_str() == Some(node_id))
+        .map(|n| n["data"]["config"].clone())
+}
+
+/// Why a hook request failed its trigger's auth policy.
+#[derive(Debug, PartialEq, Eq)]
+enum HookAuthError {
+    /// The request did not present valid credentials (401).
+    Unauthorized(&'static str),
+    /// The trigger's own configuration is unusable (500). Never fails open.
+    Misconfigured(&'static str),
+}
+
+/// Constant-time byte comparison. Only the length (not a secret) can leak.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Verifies a request against a trigger's auth policy, given the already
+/// resolved `expected` secret. Unknown auth types are rejected (fail closed).
+fn verify_hook_auth(
+    auth_type: &str,
+    expected: &str,
+    headers: &HeaderMap,
+    body: &str,
+) -> Result<(), HookAuthError> {
+    use HookAuthError::{Misconfigured, Unauthorized};
+
+    if auth_type == "none" {
+        return Ok(());
+    }
+    if expected.is_empty() {
+        return Err(Misconfigured("Webhook auth token not configured"));
+    }
+
+    let authorization = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    match auth_type {
+        "bearer" => {
+            let token = authorization
+                .strip_prefix("Bearer ")
+                .or_else(|| authorization.strip_prefix("bearer "));
+            match token {
+                Some(t) if ct_eq(t.as_bytes(), expected.as_bytes()) => Ok(()),
+                _ => Err(Unauthorized(
+                    "Unauthorized: invalid or missing Bearer token",
+                )),
+            }
+        }
+        "basic" => {
+            // Expected secret is "username:password"; the header carries it base64-encoded.
+            let decoded = authorization
+                .strip_prefix("Basic ")
+                .or_else(|| authorization.strip_prefix("basic "))
+                .and_then(|b64| {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD.decode(b64).ok()
+                });
+            match decoded {
+                Some(bytes) if ct_eq(&bytes, expected.as_bytes()) => Ok(()),
+                _ => Err(Unauthorized(
+                    "Unauthorized: invalid or missing Basic credentials",
+                )),
+            }
+        }
+        "hmac" => {
+            // HMAC-SHA256 of the raw body, from X-Signature or X-Hub-Signature-256.
+            use hmac::{Hmac, Mac};
+            let raw_sig = headers
+                .get("x-signature")
+                .or_else(|| headers.get("x-hub-signature-256"))
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let provided = raw_sig.strip_prefix("sha256=").unwrap_or(raw_sig);
+            let mut mac = Hmac::<sha2::Sha256>::new_from_slice(expected.as_bytes())
+                .map_err(|_| Misconfigured("Invalid HMAC key configuration"))?;
+            mac.update(body.as_bytes());
+            // `verify_slice` is constant-time; malformed hex decodes to empty and fails.
+            mac.verify_slice(&hex::decode(provided).unwrap_or_default())
+                .map_err(|_| Unauthorized("Unauthorized: HMAC signature mismatch"))
+        }
+        _ => Err(Misconfigured("Unsupported webhook auth type")),
+    }
+}
+
+/// Enforces a trigger's auth policy for an incoming hook request.
+///
+/// Resolves `vault:` token references under the flow owner, then delegates to
+/// [`verify_hook_auth`]. The error is the ready-to-send HTTP response.
+async fn authorize_trigger(
+    config: &serde_json::Value,
+    headers: &HeaderMap,
+    body: &str,
+    owner_id: Uuid,
+    vault: &dyn CredentialVault,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let reject = |status: StatusCode, msg: &str| (status, Json(serde_json::json!({"error": msg})));
+
+    let auth_type = config["authType"].as_str().unwrap_or("none");
+    match auth_type {
+        "none" => return Ok(()),
+        "bearer" | "basic" | "hmac" => {}
+        other => {
+            // Fail closed: an auth type we don't understand must not let requests through.
+            warn!(
+                auth_type = other,
+                "Hook rejected: unsupported webhook auth type"
+            );
+            return Err(reject(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Unsupported webhook auth type",
+            ));
+        }
+    }
+
+    let raw_token = config["authToken"].as_str().unwrap_or("");
+    let expected = match raw_token.strip_prefix("vault:") {
+        Some(key) => vault.retrieve(owner_id, key).await.map_err(|e| {
+            warn!(error = %e, key, "Failed to resolve vault ref for webhook auth");
+            reject(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to resolve auth credential",
+            )
+        })?,
+        None => raw_token.to_string(),
+    };
+
+    verify_hook_auth(auth_type, &expected, headers, body).map_err(|e| match e {
+        HookAuthError::Unauthorized(msg) => reject(StatusCode::UNAUTHORIZED, msg),
+        HookAuthError::Misconfigured(msg) => reject(StatusCode::INTERNAL_SERVER_ERROR, msg),
+    })
+}
+
+/// Restricts `flow` to `trigger` and everything reachable downstream of it.
+///
+/// The engine delivers the trigger message to every root node, so without this
+/// a request to one trigger would also fire every other trigger's branch.
+/// Edges coming from pruned nodes are dropped too, so a shared downstream node
+/// only receives this branch's messages.
+fn restrict_to_trigger(flow: &mut Flow, trigger: Uuid) {
+    let mut keep = std::collections::HashSet::from([trigger]);
+    let mut queue = std::collections::VecDeque::from([trigger]);
+    while let Some(node) = queue.pop_front() {
+        for edge in flow.edges.iter().filter(|e| e.from_node == node) {
+            if keep.insert(edge.to_node) {
+                queue.push_back(edge.to_node);
+            }
+        }
+    }
+    flow.nodes.retain(|n| keep.contains(&n.id));
+    flow.edges
+        .retain(|e| keep.contains(&e.from_node) && keep.contains(&e.to_node));
 }
 
 /// ANY /hook/{flow_id} or /hook/{flow_id}/{*path}
@@ -830,12 +1050,12 @@ async fn hook_handler(
     // This blocks triggering an arbitrary flow by id, using the wrong HTTP
     // method, or hitting a path the flow never configured. The matched route
     // also yields the owner, which scopes credential resolution to their vault.
-    let owner_id = match state
+    let hook = match state
         .storage
         .find_hook_route(flow_id, &method_str, &sub_path)
         .await
     {
-        Ok(Some(uid)) => uid,
+        Ok(Some(hook)) => hook,
         Ok(None) => {
             warn!(flow_id = %flow_id, method = %method_str, path = %sub_path,
                 "Hook rejected: no matching deployed route");
@@ -854,160 +1074,61 @@ async fn hook_handler(
             );
         }
     };
+    let owner_id = hook.user_id;
 
-    // Load the flow (authorized above)
-    let stored_flow = match state.storage.get_flow(flow_id).await {
-        Ok(f) => f,
-        Err(e) => {
-            error!(error = %e, "Failed to load flow");
+    // Run the deployed snapshot, never the live (editable) flow (A-05).
+    let snapshot = match state.storage.get_deployment(flow_id).await {
+        Ok(Some(flow)) => flow,
+        Ok(None) => {
+            warn!(flow_id = %flow_id, "Hook rejected: route has no deployment snapshot");
             return (
                 StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": format!("Flow not found: {}", e)})),
+                Json(serde_json::json!({"error": "Flow is not deployed"})),
+            );
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to load deployment snapshot");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Internal error"})),
             );
         }
     };
 
-    // ── Webhook auth validation ─────────────────────────────────────
-    // Extract auth config from the webhook-trigger / webhook node in canvas
-    if let Some(canvas_nodes) = stored_flow
-        .metadata
-        .positions
-        .get("canvas_nodes")
-        .and_then(|v| v.as_array())
+    // Enforce the auth policy of the trigger bound to THIS route (A-01), not
+    // of whichever trigger happens to come first on the canvas.
+    let Some(trigger_config) = trigger_node_config(&snapshot, &hook.node_id) else {
+        error!(flow_id = %flow_id, node_id = %hook.node_id, "Deployed trigger node missing from snapshot");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Deployed trigger not found"})),
+        );
+    };
+    if let Err(rejection) = authorize_trigger(
+        &trigger_config,
+        &headers,
+        &body,
+        owner_id,
+        state.vault.as_ref(),
+    )
+    .await
     {
-        for node in canvas_nodes {
-            let node_type = node["data"]["type"].as_str().unwrap_or("");
-            if node_type == "webhook-trigger" || node_type == "webhook" {
-                let config = &node["data"]["config"];
-                let auth_type = config["authType"].as_str().unwrap_or("none");
-
-                if auth_type != "none" {
-                    // Resolve the token (may be a vault reference like "vault:my-key")
-                    let raw_token = config["authToken"].as_str().unwrap_or("");
-                    let expected_token = if let Some(key) = raw_token.strip_prefix("vault:") {
-                        match state.vault.retrieve(owner_id, key).await {
-                            Ok(secret) => secret,
-                            Err(e) => {
-                                warn!(error = %e, key = key, "Failed to resolve vault ref for webhook auth");
-                                return (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(
-                                        serde_json::json!({"error": "Failed to resolve auth credential"}),
-                                    ),
-                                );
-                            }
-                        }
-                    } else {
-                        raw_token.to_string()
-                    };
-
-                    if expected_token.is_empty() {
-                        warn!(flow_id = %flow_id, "Webhook auth configured but token is empty");
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(serde_json::json!({"error": "Webhook auth token not configured"})),
-                        );
-                    }
-
-                    match auth_type {
-                        "bearer" => {
-                            let provided = headers
-                                .get("authorization")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("");
-                            let valid = provided
-                                .strip_prefix("Bearer ")
-                                .or_else(|| provided.strip_prefix("bearer "))
-                                .map(|t| t == expected_token)
-                                .unwrap_or(false);
-                            if !valid {
-                                info!(flow_id = %flow_id, "Webhook auth failed: invalid or missing Bearer token");
-                                return (
-                                    StatusCode::UNAUTHORIZED,
-                                    Json(
-                                        serde_json::json!({"error": "Unauthorized: invalid or missing Bearer token"}),
-                                    ),
-                                );
-                            }
-                        }
-                        "basic" => {
-                            // Expected token format: "username:password" (base64-encoded in the header)
-                            let provided = headers
-                                .get("authorization")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("");
-                            let valid = provided
-                                .strip_prefix("Basic ")
-                                .or_else(|| provided.strip_prefix("basic "))
-                                .and_then(|b64| {
-                                    use base64::Engine;
-                                    base64::engine::general_purpose::STANDARD.decode(b64).ok()
-                                })
-                                .and_then(|bytes| String::from_utf8(bytes).ok())
-                                .map(|decoded| decoded == expected_token)
-                                .unwrap_or(false);
-                            if !valid {
-                                info!(flow_id = %flow_id, "Webhook auth failed: invalid or missing Basic credentials");
-                                return (
-                                    StatusCode::UNAUTHORIZED,
-                                    Json(
-                                        serde_json::json!({"error": "Unauthorized: invalid or missing Basic credentials"}),
-                                    ),
-                                );
-                            }
-                        }
-                        "hmac" => {
-                            // HMAC-SHA256: verify X-Signature header against body
-                            let raw_sig = headers
-                                .get("x-signature")
-                                .or_else(|| headers.get("x-hub-signature-256"))
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("");
-                            let provided_sig = raw_sig.strip_prefix("sha256=").unwrap_or(raw_sig);
-                            use hmac::{Hmac, Mac};
-                            use sha2::Sha256;
-                            type HmacSha256 = Hmac<Sha256>;
-                            let mut mac = match HmacSha256::new_from_slice(
-                                expected_token.as_bytes(),
-                            ) {
-                                Ok(m) => m,
-                                Err(_) => {
-                                    return (
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        Json(
-                                            serde_json::json!({"error": "Invalid HMAC key configuration"}),
-                                        ),
-                                    );
-                                }
-                            };
-                            mac.update(body.as_bytes());
-                            // Decode the provided hex signature to raw bytes and let
-                            // `Mac::verify_slice` perform a constant-time comparison
-                            // (SEC-008). A malformed hex signature simply fails to
-                            // decode and is rejected, matching the previous behavior.
-                            let provided_bytes = hex::decode(provided_sig).unwrap_or_default();
-                            if mac.verify_slice(&provided_bytes).is_err() {
-                                info!(flow_id = %flow_id, "Webhook auth failed: HMAC signature mismatch");
-                                return (
-                                    StatusCode::UNAUTHORIZED,
-                                    Json(
-                                        serde_json::json!({"error": "Unauthorized: HMAC signature mismatch"}),
-                                    ),
-                                );
-                            }
-                        }
-                        other => {
-                            warn!(flow_id = %flow_id, auth_type = other, "Unknown webhook auth type");
-                        }
-                    }
-                }
-                break; // Only check the first trigger node
-            }
-        }
+        info!(flow_id = %flow_id, node_id = %hook.node_id, "Hook rejected by trigger auth policy");
+        return rejection;
     }
 
+    // Bound concurrent executions per flow (A-06). The slot is held until this
+    // handler returns; by then the execution has finished or been cancelled.
+    let Some(_slot) = state.hook_limits.try_acquire(flow_id) else {
+        warn!(flow_id = %flow_id, "Hook rejected: flow at its concurrent execution limit");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "Too many concurrent executions for this flow"})),
+        );
+    };
+
     // Build executable flow (vault refs resolved under the flow owner)
-    let (exec_flow, _id_map) = match canvas_to_flow(&stored_flow, owner_id, state.vault.as_ref())
+    let (mut exec_flow, id_map) = match canvas_to_flow(&snapshot, owner_id, state.vault.as_ref())
         .await
     {
         Ok(result) => result,
@@ -1020,6 +1141,17 @@ async fn hook_handler(
             );
         }
     };
+
+    // Execute only the matched trigger's branch (A-01): other roots, including
+    // other triggers with different auth policies, must not fire.
+    let Some(&trigger_id) = id_map.get(&hook.node_id) else {
+        error!(flow_id = %flow_id, node_id = %hook.node_id, "Trigger node not compiled");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Deployed trigger not found"})),
+        );
+    };
+    restrict_to_trigger(&mut exec_flow, trigger_id);
 
     // Parse body as JSON (or wrap raw string)
     let body_json: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| {
@@ -1095,7 +1227,8 @@ async fn await_flow_response(
     rx: tokio::sync::oneshot::Receiver<z8run_core::nodes::http_out::WebhookResponse>,
     state: &Arc<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+    let timeout = state.hook_limits.timeout;
+    match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(response)) => {
             info!(
                 flow_id = %flow_id,
@@ -1114,11 +1247,17 @@ async fn await_flow_response(
             )
         }
         Err(_) => {
-            warn!(flow_id = %flow_id, "Flow timed out after 10 seconds");
+            // The caller is gone: stop the execution instead of letting it keep
+            // spending CPU, network and third-party quota (A-06).
+            let cancelled = state.engine.cancel_execution(trace_id).await;
+            warn!(flow_id = %flow_id, timeout_secs = timeout.as_secs(), cancelled,
+                "Hook timed out; execution cancelled");
             state.webhook_responders.write().await.remove(&trace_id);
             (
                 StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({"error": "Flow execution timed out (10s)"})),
+                Json(serde_json::json!({
+                    "error": format!("Flow execution timed out ({}s)", timeout.as_secs())
+                })),
             )
         }
     }
@@ -1363,5 +1502,104 @@ mod tests {
             "canvas_edges": [{"source": "n1"}]
         }))
         .is_err());
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    /// A-01: only the matched trigger's branch survives; edges from other
+    /// roots into shared nodes are dropped, so those branches cannot fire.
+    #[test]
+    fn restrict_to_trigger_keeps_only_the_triggered_branch() {
+        let mut flow = Flow::new("f");
+        let node = |name: &str| Node::new(name, "debug");
+        let (a, b, shared, a_only, b_only) =
+            (node("A"), node("B"), node("S"), node("A1"), node("B1"));
+        let ids = (a.id, b.id, shared.id, a_only.id, b_only.id);
+        for n in [a, b, shared, a_only, b_only] {
+            flow.nodes.push(n);
+        }
+        flow.edges.push(Edge::new(ids.0, "output", ids.2, "input")); // A -> S
+        flow.edges.push(Edge::new(ids.1, "output", ids.2, "input")); // B -> S
+        flow.edges.push(Edge::new(ids.0, "output", ids.3, "input")); // A -> A1
+        flow.edges.push(Edge::new(ids.1, "output", ids.4, "input")); // B -> B1
+
+        restrict_to_trigger(&mut flow, ids.0);
+
+        let mut kept: Vec<Uuid> = flow.nodes.iter().map(|n| n.id).collect();
+        kept.sort();
+        let mut expected = vec![ids.0, ids.2, ids.3];
+        expected.sort();
+        assert_eq!(kept, expected, "only A and its downstream nodes remain");
+        assert_eq!(flow.edges.len(), 2, "B -> S and B -> B1 are dropped");
+        assert!(flow.edges.iter().all(|e| e.from_node == ids.0));
+    }
+
+    #[test]
+    fn verify_hook_auth_bearer_and_basic() {
+        use base64::Engine;
+        assert_eq!(verify_hook_auth("none", "", &HeaderMap::new(), ""), Ok(()));
+
+        let ok = headers(&[("authorization", "Bearer s3cret")]);
+        assert_eq!(verify_hook_auth("bearer", "s3cret", &ok, ""), Ok(()));
+        for bad in [
+            headers(&[("authorization", "Bearer nope")]),
+            headers(&[("authorization", "Bearer s3cre")]),
+            HeaderMap::new(),
+        ] {
+            assert!(matches!(
+                verify_hook_auth("bearer", "s3cret", &bad, ""),
+                Err(HookAuthError::Unauthorized(_))
+            ));
+        }
+
+        let creds = base64::engine::general_purpose::STANDARD.encode("user:pass");
+        let basic = headers(&[("authorization", &format!("Basic {creds}"))]);
+        assert_eq!(verify_hook_auth("basic", "user:pass", &basic, ""), Ok(()));
+        assert!(verify_hook_auth("basic", "user:other", &basic, "").is_err());
+    }
+
+    #[test]
+    fn verify_hook_auth_hmac() {
+        use hmac::{Hmac, Mac};
+        let body = r#"{"event":"push"}"#;
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(b"key").unwrap();
+        mac.update(body.as_bytes());
+        let sig = hex::encode(mac.finalize().into_bytes());
+
+        let good = headers(&[("x-hub-signature-256", &format!("sha256={sig}"))]);
+        assert_eq!(verify_hook_auth("hmac", "key", &good, body), Ok(()));
+        // Same signature over a tampered body must fail.
+        assert!(verify_hook_auth("hmac", "key", &good, r#"{"event":"x"}"#).is_err());
+    }
+
+    /// A-01: misconfiguration never lets a request through.
+    #[test]
+    fn verify_hook_auth_fails_closed() {
+        let any = headers(&[("authorization", "Bearer x")]);
+        assert!(matches!(
+            verify_hook_auth("magic", "secret", &any, ""),
+            Err(HookAuthError::Misconfigured(_))
+        ));
+        assert!(matches!(
+            verify_hook_auth("bearer", "", &any, ""),
+            Err(HookAuthError::Misconfigured(_))
+        ));
+    }
+
+    #[test]
+    fn ct_eq_compares_exactly() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"abcd"));
+        assert!(ct_eq(b"", b""));
     }
 }
